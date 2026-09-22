@@ -55,5 +55,13 @@ required-features = ["async", "package-zip"]
 name = "blocking"
 required-features = ["blocking"]
 
+[[test]]
+name = "contract_model"
+required-features = ["async", "package-zip"]
+
+[[test]]
+name = "contract_cache"
+required-features = ["async", "package-zip"]
+
 [profile.dev]
 debug = 1

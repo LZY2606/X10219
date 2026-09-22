@@ -61,6 +61,10 @@ impl EvalCapabilities for MemoryCacheCapabilities {
         Box::pin(async { Ok(()) })
     }
 
+    fn sync_dir(&mut self, _dir: &Path) -> std::io::Result<()> {
+        Ok(())
+    }
+
     fn read_env<'a>(&'a mut self, _name: &'a str) -> BoxFuture<'a, pklr::Result<Option<String>>> {
         Box::pin(async { Ok(None) })
     }
@@ -339,11 +343,17 @@ fn blocking_preload_uses_custom_capabilities() {
     let files = files.lock().unwrap();
     assert_eq!(files.len(), 2);
     assert!(files.values().any(|value| value == b"answer = 42\n"));
-    assert!(
-        files
-            .values()
-            .any(|value| value == b"https://example.com/pkg@1.0.0.pkl")
-    );
+    let metadata = files
+        .values()
+        .find(|value| value.first() == Some(&b'{'))
+        .expect("versioned JSON metadata sidecar");
+    let metadata: serde_json::Value = serde_json::from_slice(metadata).unwrap();
+    assert_eq!(metadata["version"], 1);
+    assert_eq!(metadata["url"], "https://example.com/pkg@1.0.0.pkl");
+    assert!(metadata["digest"].as_str().unwrap().starts_with("fnv1a64:"));
+    let blob = metadata["blob"].as_str().unwrap();
+    assert!(blob.ends_with(".pkl"), "{blob}");
+    assert!(!blob.contains('/') && !blob.contains(".."), "{blob}");
 }
 
 #[test]

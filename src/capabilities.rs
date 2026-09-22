@@ -10,6 +10,26 @@ use crate::Result;
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
 
+/// Boundary at which an atomic write can be made to fail.
+///
+/// `FileWrite` fires before bytes are written to the temporary file,
+/// `Flush` fires after the write but before the file is fsync-ed, and
+/// `Rename` fires after a successful flush, just before the rename.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AtomicWriteStage {
+    FileWrite,
+    Flush,
+    Rename,
+}
+
+/// Result of sweeping staging files left behind by a crashed atomic write.
+#[cfg(feature = "eval-core")]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SweepResult {
+    /// Staging files that were removed.
+    pub removed_files: Vec<PathBuf>,
+}
+
 /// Host-provided IO for evaluating Pkl modules.
 ///
 /// The default evaluator still uses the native implementation, but embedders
@@ -40,8 +60,10 @@ pub trait EvalCapabilities: Send + Sync {
         bytes: &'a [u8],
     ) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
-            crate::eval::write_atomic(path, bytes)
-                .map_err(|error| crate::Error::Io(path.to_path_buf(), error))
+            crate::eval::write_atomic_with_hook(path, bytes, |stage| {
+                self.atomic_write_fault(path, stage, bytes.len())
+            })
+            .map_err(|error| crate::Error::Io(path.to_path_buf(), error))
         })
     }
 
@@ -58,6 +80,35 @@ pub trait EvalCapabilities: Send + Sync {
         destination: &'a Path,
     ) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move { extract_zip_sync(bytes, destination) })
+    }
+
+    /// Hook consulted at each boundary of an atomic write.
+    ///
+    /// Returning an error aborts the write at that boundary. Production
+    /// capabilities always return `Ok(())`; test doubles inject failures here.
+    fn atomic_write_fault(
+        &mut self,
+        _path: &Path,
+        _stage: AtomicWriteStage,
+        _bytes_len: usize,
+    ) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    /// fsync a directory so a recent rename is durable. Test doubles may
+    /// record the event or fail it.
+    fn sync_dir(&mut self, dir: &Path) -> std::io::Result<()> {
+        crate::eval::sync_dir(dir)
+    }
+
+    /// Remove staging files (matching `.<name>.tmp-*`) left in `dir` by an
+    /// atomic write that crashed before its rename. Returns the removed paths.
+    /// A missing directory is not an error.
+    fn sweep_staging_files<'a>(
+        &'a mut self,
+        dir: &'a Path,
+    ) -> BoxFuture<'a, Result<crate::capabilities::SweepResult>> {
+        Box::pin(async move { crate::eval::sweep_staging_files(dir) })
     }
 
     fn read_env<'a>(&'a mut self, name: &'a str) -> BoxFuture<'a, Result<Option<String>>>;
