@@ -53,8 +53,48 @@ pub enum Error {
     #[error("Import not found: {0}")]
     ImportNotFound(String),
 
+    /// Persistent package cache metadata could not be trusted.
+    #[error("invalid package cache for {url}: {reason}")]
+    CacheInvalid { url: String, reason: CacheInvalidReason },
+
+    /// Writing to the persistent package cache failed at a durability boundary.
+    #[error("package cache write failed for {url}: {reason}")]
+    CacheWrite { url: String, reason: String },
+
     #[error("Unsupported feature: {0}")]
     Unsupported(String),
+}
+
+/// Why a persisted package cache entry was rejected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CacheInvalidReason {
+    /// Metadata was absent, truncated, or not valid JSON.
+    CorruptMetadata,
+    /// Metadata advertised a format this build cannot read.
+    UnsupportedVersion(u32),
+    /// The blob digest did not match the metadata claim.
+    DigestMismatch,
+    /// The blob path pointed outside of the cache directory.
+    BlobPathEscape,
+    /// The metadata belonged to a different URL.
+    UrlMismatch,
+    /// The blob referenced by metadata was missing.
+    MissingBlob,
+}
+
+impl std::fmt::Display for CacheInvalidReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CorruptMetadata => write!(f, "metadata is corrupt"),
+            Self::UnsupportedVersion(version) => {
+                write!(f, "unsupported cache metadata version {version}")
+            }
+            Self::DigestMismatch => write!(f, "blob digest mismatch"),
+            Self::BlobPathEscape => write!(f, "blob path escapes the cache directory"),
+            Self::UrlMismatch => write!(f, "metadata does not belong to the requested url"),
+            Self::MissingBlob => write!(f, "cached blob is missing"),
+        }
+    }
 }
 
 impl Error {
