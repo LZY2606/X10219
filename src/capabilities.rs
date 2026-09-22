@@ -10,6 +10,54 @@ use crate::Result;
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
 
+/// Semantic event emitted while evaluating a module graph.
+///
+/// Capabilities may record these to observe the evaluation in a deterministic,
+/// scheduler-independent way. The default implementation ignores them, so
+/// installing recording capabilities does not change evaluation semantics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TraceEvent {
+    /// A rewrite rule matched and changed a URL (longest matching prefix).
+    Rewrite { from: String, to: String },
+    /// A non-package HTTP source is about to be fetched.
+    HttpFetch { url: String },
+    /// The persistent package cache was consulted.
+    PackageProbe { url: String, outcome: ProbeOutcome },
+    /// A package blob was committed to the persistent cache.
+    PackageStore { url: String },
+    /// A package was fetched over the network (cache miss while online).
+    PackageFetch { url: String },
+    /// Stale staging files and rollback backups were swept from the cache.
+    PackageSweep { removed: usize },
+    /// A module was encountered while already evaluating on the active path.
+    CycleBreak { key: String },
+    /// A scoped (amends) revisit returned an empty placeholder.
+    InFlightReturn { key: String },
+    /// A module began evaluating. `key` is its canonical path or normalized URL.
+    LoadModule { key: String, role: ModuleRole },
+    /// An environment variable was actually read.
+    EnvRead { name: String },
+    /// A system property was actually read.
+    PropRead { name: String },
+}
+
+/// Result of consulting the persistent package cache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeOutcome {
+    Hit,
+    Miss,
+    Invalid,
+}
+
+/// Why a module is being evaluated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModuleRole {
+    Entry,
+    Import,
+    Amend,
+}
+
 /// Host-provided IO for evaluating Pkl modules.
 ///
 /// The default evaluator still uses the native implementation, but embedders
@@ -81,6 +129,157 @@ pub trait EvalCapabilities: Send + Sync {
         base: &'a Path,
         pattern: &'a str,
     ) -> BoxFuture<'a, Result<Vec<PathBuf>>>;
+
+    /// Observe a semantic evaluation event. Default: ignore.
+    fn trace_event(&mut self, _event: &TraceEvent) {}
+
+    /// Stage `bytes` for an eventual [`commit_rename`](Self::commit_rename)
+    /// into `target`. Returns the staging file path. The default
+    /// implementation writes to a unique sibling file and flushes it.
+    fn write_staged<'a>(
+        &'a mut self,
+        target: &'a Path,
+        bytes: &'a [u8],
+    ) -> BoxFuture<'a, Result<PathBuf>> {
+        Box::pin(async move {
+            default_write_staged(target, bytes)
+                .map_err(|error| crate::Error::Io(target.to_path_buf(), error))
+        })
+    }
+
+    /// Atomically move a staged file produced by [`write_staged`](Self::write_staged)
+    /// onto `target`. `target` must not exist at commit time.
+    fn commit_rename<'a>(
+        &'a mut self,
+        from: &'a Path,
+        to: &'a Path,
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            default_commit_rename(from, to)
+                .map_err(|error| crate::Error::Io(to.to_path_buf(), error))
+        })
+    }
+
+    /// Best-effort durable sync of the directory containing committed files.
+    fn sync_directory<'a>(&'a mut self, dir: &'a Path) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            default_sync_directory(dir)
+                .map_err(|error| crate::Error::Io(dir.to_path_buf(), error))
+        })
+    }
+
+    /// Remove staging files and rollback backups left under `root` by an
+    /// interrupted previous process. Returns the number of files removed.
+    fn cleanup_staging<'a>(&'a mut self, root: &'a Path) -> BoxFuture<'a, Result<usize>> {
+        Box::pin(async move {
+            default_cleanup_staging(root)
+                .map_err(|error| crate::Error::Io(root.to_path_buf(), error))
+        })
+    }
+}
+
+fn default_stage_name(target: &Path) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let file_name = target
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("cache");
+    target.with_file_name(format!(
+        ".{file_name}.stage-{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ))
+}
+
+#[cfg_attr(not(feature = "native-io"), allow(dead_code))]
+fn default_write_staged(target: &Path, bytes: &[u8]) -> std::io::Result<PathBuf> {
+    use std::io::Write;
+
+    let staged = default_stage_name(target);
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&staged)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    drop(file);
+    Ok(staged)
+}
+
+#[cfg_attr(not(feature = "native-io"), allow(dead_code))]
+fn default_commit_rename(from: &Path, to: &Path) -> std::io::Result<()> {
+    // Cache writers commit onto a target that has just been moved to a
+    // rollback backup, so the plain rename is atomic on Unix and Windows.
+    std::fs::rename(from, to)
+}
+
+#[cfg_attr(not(feature = "native-io"), allow(dead_code))]
+fn default_sync_directory(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let file = std::fs::File::open(dir)?;
+        // SAFETY: the borrowed fd is only used for fsync within this call.
+        let result = unsafe { libc_fsync(file.as_raw_fd()) };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+extern "C" {
+    fn fsync(fd: std::os::unix::io::RawFd) -> std::os::raw::c_int;
+}
+
+#[cfg(unix)]
+unsafe fn libc_fsync(fd: std::os::unix::io::RawFd) -> std::os::raw::c_int {
+    unsafe { fsync(fd) }
+}
+
+/// Name patterns removed from the cache directory on startup:
+/// `.<dest>.stage-*` (crashed commits) and `.<dest>.old-*` (rollback backups).
+#[cfg_attr(not(feature = "native-io"), allow(dead_code))]
+fn is_staging_name(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix('.') else {
+        return false;
+    };
+    rest.contains(".stage-") || rest.contains(".old-")
+}
+
+#[cfg_attr(not(feature = "native-io"), allow(dead_code))]
+fn default_cleanup_staging(root: &Path) -> std::io::Result<usize> {
+    let mut removed = 0;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            let file_type = entry.file_type()?;
+            if file_type.is_dir() {
+                stack.push(path);
+            } else if let Some(name) = path.file_name().and_then(|name| name.to_str())
+                && is_staging_name(name)
+                && std::fs::remove_file(&path).is_ok()
+            {
+                removed += 1;
+            }
+        }
+    }
+    Ok(removed)
 }
 
 #[cfg(feature = "native-io")]
