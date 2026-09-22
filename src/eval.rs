@@ -36,6 +36,8 @@ pub struct Evaluator {
     package_dirs: HashMap<String, PathBuf>,
     /// Directory used to persist downloaded package content across evaluators.
     package_cache_dir: Option<PathBuf>,
+    /// Whether abandoned temp files have been swept from the cache directory.
+    cache_swept: bool,
     /// HTTP URL roots whose sources belong to direct-download packages.
     package_http_roots: HashSet<String>,
     /// Whether network access is disabled for this evaluator.
@@ -90,6 +92,7 @@ impl Default for Evaluator {
             #[cfg(feature = "package-zip-core")]
             package_dirs: HashMap::new(),
             package_cache_dir: None,
+            cache_swept: false,
             package_http_roots: HashSet::new(),
             offline: false,
             http_rewrites: Vec::new(),
@@ -125,6 +128,7 @@ impl Evaluator {
             #[cfg(feature = "package-zip-core")]
             package_dirs: HashMap::new(),
             package_cache_dir: None,
+            cache_swept: false,
             package_http_roots: HashSet::new(),
             offline: false,
             http_rewrites: Vec::new(),
@@ -420,6 +424,7 @@ impl Evaluator {
     }
 
     async fn fetch_package_bytes(&mut self, url: &str, extension: &str) -> Result<Vec<u8>> {
+        self.sweep_package_cache().await?;
         match self.read_package_cache(url, extension).await {
             Ok(Some(bytes)) => match validate_package_bytes(url, extension, &bytes) {
                 Ok(()) => return Ok(bytes),
@@ -455,22 +460,24 @@ impl Evaluator {
         let Some(cache_dir) = &self.package_cache_dir else {
             return Ok(None);
         };
-        let (data_path, url_path) = package_cache_paths(cache_dir, url, extension);
-        let cached_url = match self.capabilities.read_to_string(&url_path).await {
-            Ok(cached_url) => cached_url,
+        let (data_path, metadata_path) = cache::entry_paths(cache_dir, url, extension)?;
+        let raw = match self.capabilities.read_to_string(&metadata_path).await {
+            Ok(raw) => raw,
             Err(Error::Io(_, error)) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(None);
             }
             Err(error) => return Err(error),
         };
-        if cached_url != url {
-            return Ok(None);
-        }
-        match self.capabilities.read_bytes(&data_path).await {
-            Ok(bytes) => Ok(Some(bytes)),
-            Err(Error::Io(_, error)) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(error),
-        }
+        let metadata = cache::CacheMetadata::parse(&raw)?;
+        let bytes = match self.capabilities.read_bytes(&data_path).await {
+            Ok(bytes) => bytes,
+            Err(Error::Io(_, error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(None)
+            }
+            Err(error) => return Err(error),
+        };
+        metadata.verify(url, extension, &bytes)?;
+        Ok(Some(bytes))
     }
 
     /// Cache `bytes` for `url`. The fetch path ignores the error; preloading does not.
@@ -483,14 +490,17 @@ impl Evaluator {
         let Some(cache_dir) = &self.package_cache_dir else {
             return Ok(());
         };
-        let (data_path, url_path) = package_cache_paths(cache_dir, url, extension);
+        let (data_path, metadata_path) = cache::entry_paths(cache_dir, url, extension)?;
         let Some(parent) = data_path.parent() else {
             return Ok(());
         };
         self.capabilities.create_dir_all(parent).await?;
+        let metadata = cache::CacheMetadata::new(url, extension, bytes);
+        // The blob lands first; the envelope is the commit marker, so a crash
+        // between the two never leaves an entry that could be mistaken for a hit.
         self.capabilities.write_atomic(&data_path, bytes).await?;
         self.capabilities
-            .write_atomic(&url_path, url.as_bytes())
+            .write_atomic(&metadata_path, metadata.to_json().as_bytes())
             .await
     }
 
@@ -527,9 +537,10 @@ impl Evaluator {
         let Some(cache_dir) = &self.package_cache_dir else {
             return;
         };
-        let (data_path, url_path) = package_cache_paths(cache_dir, url, extension);
-        let _ = self.capabilities.remove_file(&data_path).await;
-        let _ = self.capabilities.remove_file(&url_path).await;
+        if let Ok((data_path, metadata_path)) = cache::entry_paths(cache_dir, url, extension) {
+            let _ = self.capabilities.remove_file(&data_path).await;
+            let _ = self.capabilities.remove_file(&metadata_path).await;
+        }
     }
 
     /// Download a package zip and extract it to a temp directory.

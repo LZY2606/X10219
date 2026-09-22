@@ -55,6 +55,10 @@ pub enum Error {
 
     #[error("Unsupported feature: {0}")]
     Unsupported(String),
+
+    /// A persistent package cache entry could not be read or validated.
+    #[error("package cache error: {0}")]
+    Cache(#[from] crate::cache::CacheError),
 }
 
 impl Error {

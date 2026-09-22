@@ -10,6 +10,18 @@ use crate::Result;
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
 
+#[cfg(unix)]
+extern "C" {
+    fn fsync(fd: std::os::unix::io::RawFd) -> std::ffi::c_int;
+}
+
+#[cfg(unix)]
+unsafe fn libc_fsync(fd: std::os::unix::io::RawFd) -> std::ffi::c_int {
+    // SAFETY: the caller passes an owned, open descriptor; fsync only blocks
+    // until the kernel has flushed it.
+    unsafe { fsync(fd) }
+}
+
 /// Host-provided IO for evaluating Pkl modules.
 ///
 /// The default evaluator still uses the native implementation, but embedders
@@ -40,8 +52,127 @@ pub trait EvalCapabilities: Send + Sync {
         bytes: &'a [u8],
     ) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
-            crate::eval::write_atomic(path, bytes)
+            // The default implementation crosses four individually overridable
+            // boundaries so hosts (and tests) can observe or fail each stage:
+            // temp-file creation, content flush, atomic rename, and directory
+            // sync. None of the stages ever exposes a half-written destination.
+            let target_name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("cache");
+            let Some(parent) = path.parent() else {
+                return Err(crate::Error::Eval(format!(
+                    "atomic write target has no parent directory: {}",
+                    path.display()
+                )));
+            };
+            let temp_path = path.with_file_name(crate::cache::temp_file_name(target_name));
+            let write_result = self.create_temp_file(&temp_path, bytes).await;
+            if let Err(error) = write_result {
+                let _ = self.remove_file(&temp_path).await;
+                return Err(error);
+            }
+            if let Err(error) = self.rename(&temp_path, path).await {
+                let _ = self.remove_file(&temp_path).await;
+                return Err(error);
+            }
+            if let Err(error) = self.sync_directory(parent).await {
+                return Err(crate::Error::Io(path.to_path_buf(), error));
+            }
+            Ok(())
+        })
+    }
+
+    /// Create `path` exclusively and flush `bytes` (`write_all` + `fsync`).
+    fn create_temp_file<'a>(
+        &'a mut self,
+        path: &'a Path,
+        bytes: &'a [u8],
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+                .map_err(|error| crate::Error::Io(path.to_path_buf(), error))?;
+            file.write_all(bytes)
+                .and_then(|()| file.sync_all())
                 .map_err(|error| crate::Error::Io(path.to_path_buf(), error))
+        })
+    }
+
+    /// Atomically move `from` to `to`, replacing an existing destination.
+    fn rename<'a>(
+        &'a mut self,
+        from: &'a Path,
+        to: &'a Path,
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            match std::fs::rename(from, to) {
+                Ok(()) => Ok(()),
+                // Windows rename does not replace an existing file.
+                Err(_) if to.exists() => std::fs::remove_file(to)
+                    .and_then(|()| std::fs::rename(from, to))
+                    .map_err(|error| crate::Error::Io(to.to_path_buf(), error)),
+                Err(error) => Err(crate::Error::Io(to.to_path_buf(), error)),
+            }
+        })
+    }
+
+    /// fsync a directory so a recent rename survives a crash.
+    fn sync_directory<'a>(&'a mut self, path: &'a Path) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            #[cfg(unix)]
+            {
+                use std::os::unix::io::AsRawFd;
+                let dir = std::fs::File::open(path)
+                    .map_err(|error| crate::Error::Io(path.to_path_buf(), error))?;
+                // SAFETY: `dir` owns a valid, open file descriptor.
+                let result = unsafe { libc_fsync(dir.as_raw_fd()) };
+                if result == 0 {
+                    Ok(())
+                } else {
+                    Err(crate::Error::Io(
+                        path.to_path_buf(),
+                        std::io::Error::last_os_error(),
+                    ))
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = path;
+                Ok(())
+            }
+        })
+    }
+
+    /// List immediate children of a directory as `(file_name, is_directory)`.
+    /// Missing directories report an empty listing.
+    fn list_directory<'a>(
+        &'a mut self,
+        path: &'a Path,
+    ) -> BoxFuture<'a, Result<Vec<(std::ffi::OsString, bool)>>> {
+        Box::pin(async move {
+            let entries = match std::fs::read_dir(path) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(Vec::new())
+                }
+                Err(error) => {
+                    return Err(crate::Error::Io(path.to_path_buf(), error));
+                }
+            };
+            let mut children = Vec::new();
+            for entry in entries {
+                let entry = entry.map_err(|error| crate::Error::Io(path.to_path_buf(), error))?;
+                let is_dir = entry
+                    .file_type()
+                    .map(|file_type| file_type.is_dir())
+                    .unwrap_or(false);
+                children.push((entry.file_name(), is_dir));
+            }
+            Ok(children)
         })
     }
 
@@ -250,13 +381,13 @@ impl EvalCapabilities for NativeCapabilities {
             #[cfg(feature = "async")]
             {
                 if tokio::runtime::Handle::try_current().is_err() {
-                    return crate::eval::write_atomic(path, bytes)
+                    return crate::cache::write_atomic_native(path, bytes)
                         .map_err(|error| crate::Error::Io(path.to_path_buf(), error));
                 }
                 let path = path.to_path_buf();
                 let task_path = path.clone();
                 let bytes = bytes.to_vec();
-                tokio::task::spawn_blocking(move || crate::eval::write_atomic(&task_path, &bytes))
+                tokio::task::spawn_blocking(move || crate::cache::write_atomic_native(&task_path, &bytes))
                     .await
                     .map_err(|error| {
                         crate::Error::Eval(format!("atomic write task failed: {error}"))
@@ -264,7 +395,7 @@ impl EvalCapabilities for NativeCapabilities {
                     .map_err(|error| crate::Error::Io(path, error))
             }
             #[cfg(not(feature = "async"))]
-            crate::eval::write_atomic(path, bytes)
+            crate::cache::write_atomic_native(path, bytes)
                 .map_err(|error| crate::Error::Io(path.to_path_buf(), error))
         })
     }
