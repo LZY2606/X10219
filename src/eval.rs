@@ -50,6 +50,8 @@ pub struct Evaluator {
     /// Used to deduplicate `@Deprecated` warnings so a deprecated property
     /// referenced inside a loop or template doesn't flood stderr.
     warned_deprecated: std::collections::HashSet<(String, Option<String>)>,
+    /// Whether stale temp files in the package cache have been swept yet.
+    cache_swept: bool,
 }
 
 #[derive(Clone, Default)]
@@ -95,6 +97,7 @@ impl Default for Evaluator {
             http_rewrites: Vec::new(),
             converters: Vec::new(),
             warned_deprecated: std::collections::HashSet::new(),
+            cache_swept: false,
         }
     }
 }
@@ -130,6 +133,7 @@ impl Evaluator {
             http_rewrites: Vec::new(),
             converters: Vec::new(),
             warned_deprecated: std::collections::HashSet::new(),
+            cache_swept: false,
         }
     }
 
@@ -420,6 +424,7 @@ impl Evaluator {
     }
 
     async fn fetch_package_bytes(&mut self, url: &str, extension: &str) -> Result<Vec<u8>> {
+        self.ensure_cache_swept().await;
         match self.read_package_cache(url, extension).await {
             Ok(Some(bytes)) => match validate_package_bytes(url, extension, &bytes) {
                 Ok(()) => return Ok(bytes),
@@ -456,20 +461,31 @@ impl Evaluator {
             return Ok(None);
         };
         let (data_path, url_path) = package_cache_paths(cache_dir, url, extension);
-        let cached_url = match self.capabilities.read_to_string(&url_path).await {
-            Ok(cached_url) => cached_url,
+        let metadata = match self.capabilities.read_to_string(&url_path).await {
+            Ok(metadata) => metadata,
             Err(Error::Io(_, error)) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(None);
             }
             Err(error) => return Err(error),
         };
-        if cached_url != url {
-            return Ok(None);
-        }
-        match self.capabilities.read_bytes(&data_path).await {
-            Ok(bytes) => Ok(Some(bytes)),
-            Err(Error::Io(_, error)) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(error),
+        let bytes = match self.capabilities.read_bytes(&data_path).await {
+            Ok(bytes) => bytes,
+            Err(Error::Io(_, error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                // A metadata record without its blob is a half-written entry:
+                // never a hit, and removed so later runs start clean.
+                self.remove_package_cache(url, extension).await;
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        match validate_cache_metadata(&metadata, url, &bytes) {
+            Ok(()) => Ok(Some(bytes)),
+            Err(_) => {
+                // Corrupt, outdated, or tampered entries are rejected and
+                // removed so they can never be served as cache hits.
+                self.remove_package_cache(url, extension).await;
+                Ok(None)
+            }
         }
     }
 
@@ -489,8 +505,11 @@ impl Evaluator {
         };
         self.capabilities.create_dir_all(parent).await?;
         self.capabilities.write_atomic(&data_path, bytes).await?;
+        // The metadata record is the commit point: it is written only after
+        // the blob is durable, so readers never accept a half-written entry.
+        let metadata = package_cache_metadata(url, bytes);
         self.capabilities
-            .write_atomic(&url_path, url.as_bytes())
+            .write_atomic(&url_path, metadata.as_bytes())
             .await
     }
 
@@ -506,6 +525,7 @@ impl Evaluator {
         extension: &str,
         bytes: &[u8],
     ) -> Result<()> {
+        self.ensure_cache_swept().await;
         if self.package_cache_dir.is_none() {
             return Ok(());
         }
@@ -530,6 +550,31 @@ impl Evaluator {
         let (data_path, url_path) = package_cache_paths(cache_dir, url, extension);
         let _ = self.capabilities.remove_file(&data_path).await;
         let _ = self.capabilities.remove_file(&url_path).await;
+    }
+
+    /// Remove stale temp files left in the package cache by interrupted
+    /// atomic writes. Runs once per evaluator, before the first cache
+    /// access, so files abandoned by a previous process are reclaimed at
+    /// startup. Only files matching the atomic-write temp pattern are
+    /// touched; anything else in the cache directory is left alone.
+    async fn ensure_cache_swept(&mut self) {
+        if self.cache_swept {
+            return;
+        }
+        self.cache_swept = true;
+        let Some(cache_dir) = self.package_cache_dir.clone() else {
+            return;
+        };
+        let packages_dir = cache_dir.join("packages");
+        if let Ok(stale) = self
+            .capabilities
+            .glob(&packages_dir, CACHE_TEMP_FILE_GLOB)
+            .await
+        {
+            for path in stale {
+                let _ = self.capabilities.remove_file(&path).await;
+            }
+        }
     }
 
     /// Download a package zip and extract it to a temp directory.
@@ -5618,13 +5663,75 @@ fn package_cache_paths(cache_dir: &Path, url: &str, extension: &str) -> (PathBuf
     // FNV-1a gives package URLs stable, filesystem-safe names without making
     // the cache layout depend on platform path rules. The adjacent URL file
     // detects the extraordinarily unlikely hash collision.
+    let base = cache_dir
+        .join("packages")
+        .join(format!("{:016x}", fnv1a64(url.as_bytes())));
+    (base.with_extension(extension), base.with_extension("url"))
+}
+
+fn fnv1a64(bytes: &[u8]) -> u64 {
     let mut hash = 0xcbf29ce484222325_u64;
-    for byte in url.as_bytes() {
+    for byte in bytes {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(0x100000001b3);
     }
-    let base = cache_dir.join("packages").join(format!("{hash:016x}"));
-    (base.with_extension(extension), base.with_extension("url"))
+    hash
+}
+
+/// Version marker for the package cache metadata record. Entries written by
+/// other versions are rejected so a format change never serves stale blobs.
+const PACKAGE_CACHE_METADATA_VERSION: &str = "pklr-cache-v1";
+
+/// Glob matching temp files left by interrupted atomic cache writes
+/// (see `write_atomic`): `.{name}.tmp-{pid}-{counter}`.
+const CACHE_TEMP_FILE_GLOB: &str = ".*.tmp-*";
+
+/// Metadata record stored next to each cached package blob. The blob digest
+/// lets readers detect truncated or torn writes left by an interrupted sync.
+fn package_cache_metadata(url: &str, bytes: &[u8]) -> String {
+    format!(
+        "{PACKAGE_CACHE_METADATA_VERSION}\n{url}\n{:016x}",
+        fnv1a64(bytes)
+    )
+}
+
+/// Validate a cache metadata record against the requested `url` and the blob
+/// `bytes` it accompanies. Corrupt records, unsupported versions, URL
+/// mismatches, and digest mismatches are each rejected with a distinct error.
+fn validate_cache_metadata(metadata: &str, url: &str, bytes: &[u8]) -> Result<()> {
+    let mut lines = metadata.split('\n');
+    let version = lines.next().unwrap_or("");
+    if version != PACKAGE_CACHE_METADATA_VERSION {
+        return Err(Error::Eval(format!(
+            "unsupported package cache metadata version: {version:?}"
+        )));
+    }
+    let Some(cached_url) = lines.next() else {
+        return Err(Error::Eval(
+            "corrupt package cache metadata: missing url".into(),
+        ));
+    };
+    if cached_url != url {
+        return Err(Error::Eval(format!(
+            "package cache url mismatch: expected {url}, found {cached_url}"
+        )));
+    }
+    let Some(digest) = lines.next() else {
+        return Err(Error::Eval(
+            "corrupt package cache metadata: missing digest".into(),
+        ));
+    };
+    let Ok(expected) = u64::from_str_radix(digest, 16) else {
+        return Err(Error::Eval(
+            "corrupt package cache metadata: malformed digest".into(),
+        ));
+    };
+    if expected != fnv1a64(bytes) {
+        return Err(Error::Eval(format!(
+            "package cache digest mismatch for {url}"
+        )));
+    }
+    Ok(())
 }
 
 fn validate_package_bytes(url: &str, extension: &str, bytes: &[u8]) -> Result<()> {
@@ -5676,7 +5783,10 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         return Err(error);
     }
     let rename_result = match std::fs::rename(&temp_path, path) {
-        Ok(()) => return Ok(()),
+        Ok(()) => {
+            sync_parent_dir(path);
+            return Ok(());
+        }
         // Windows rename does not replace an existing file. There is a brief
         // non-atomic gap on that platform, but the destination must not retain
         // stale bytes while its URL sidecar is updated.
@@ -5687,8 +5797,22 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     };
     if rename_result.is_err() {
         let _ = std::fs::remove_file(temp_path);
+    } else {
+        sync_parent_dir(path);
     }
     rename_result
+}
+
+/// Best-effort fsync of the directory containing `path` so a completed rename
+/// is durable. Opening a directory is not portable (it fails on Windows), so
+/// errors are ignored; durability there degrades to the file-level sync.
+fn sync_parent_dir(path: &Path) {
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if let Ok(dir) = std::fs::File::open(parent) {
+        let _ = dir.sync_all();
+    }
 }
 
 /// Resolve a `package://` URI to a download source.
