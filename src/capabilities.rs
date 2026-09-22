@@ -8,6 +8,95 @@ use std::time::Duration;
 
 use crate::Result;
 
+/// Boundaries of an atomic cache write that can fail under fault injection.
+#[cfg(feature = "native-io")]
+pub use crate::eval::{AtomicWriteFault, WriteStage};
+
+/// Plain-data snapshot of which write boundaries should fail for which stage.
+///
+/// It is captured *before* blocking work is handed to a worker thread, so the
+/// injected failure applies identically on the sync and async execution paths.
+#[cfg(feature = "native-io")]
+#[derive(Debug, Clone, Default)]
+pub struct AtomicWriteFaultsSnapshot {
+    blob: [bool; 5],
+    metadata: [bool; 5],
+}
+
+#[cfg(feature = "native-io")]
+impl AtomicWriteFaultsSnapshot {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn fail(mut self, stage: WriteStage, fault: AtomicWriteFault) -> Self {
+        *self.slot(stage, fault) = true;
+        self
+    }
+
+    pub fn has(&self, stage: WriteStage, fault: AtomicWriteFault) -> bool {
+        let flags = match stage {
+            WriteStage::Blob => &self.blob,
+            WriteStage::Metadata => &self.metadata,
+        };
+        flags[fault_index(fault)]
+    }
+
+    fn slot(&mut self, stage: WriteStage, fault: AtomicWriteFault) -> &mut bool {
+        let index = fault_index(fault);
+        match stage {
+            WriteStage::Blob => &mut self.blob[index],
+            WriteStage::Metadata => &mut self.metadata[index],
+        }
+    }
+}
+
+#[cfg(feature = "native-io")]
+fn fault_index(fault: AtomicWriteFault) -> usize {
+    match fault {
+        AtomicWriteFault::Create => 0,
+        AtomicWriteFault::Flush => 1,
+        AtomicWriteFault::FileSync => 2,
+        AtomicWriteFault::Rename => 3,
+        AtomicWriteFault::DirSync => 4,
+    }
+}
+
+/// Embedder-provided policy selecting a failure boundary for a concrete write.
+///
+/// Default capabilities return `None`; tests supply a failing policy to
+/// exercise the cache's crash-consistency contract. This is a restricted
+/// dependency-injection seam and does not change evaluation semantics.
+#[cfg(feature = "native-io")]
+pub trait AtomicWriteFaults: Send + Sync {
+    fn fault_for(&self, path: &Path, stage: WriteStage) -> Option<AtomicWriteFault>;
+
+    /// Snapshot the policy for a path/stage. Overridden by native capabilities
+    /// before dispatching blocking work.
+    fn snapshot(&self, stage: WriteStage) -> AtomicWriteFaultsSnapshot {
+        let mut snap = AtomicWriteFaultsSnapshot::new();
+        // Snapshotting needs a path; the default defers to fault_for per call.
+        let _ = (stage, &mut snap);
+        snap
+    }
+}
+
+#[cfg(feature = "native-io")]
+impl AtomicWriteFaults for AtomicWriteFaultsSnapshot {
+    fn fault_for(&self, path: &Path, stage: WriteStage) -> Option<AtomicWriteFault> {
+        let _ = path;
+        [
+            AtomicWriteFault::Create,
+            AtomicWriteFault::Flush,
+            AtomicWriteFault::FileSync,
+            AtomicWriteFault::Rename,
+            AtomicWriteFault::DirSync,
+        ]
+        .into_iter()
+        .find(|fault| self.has(stage, *fault))
+    }
+}
+
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
 
 /// Host-provided IO for evaluating Pkl modules.
@@ -48,6 +137,88 @@ pub trait EvalCapabilities: Send + Sync {
     fn remove_file<'a>(&'a mut self, path: &'a Path) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
             std::fs::remove_file(path).map_err(|error| crate::Error::Io(path.to_path_buf(), error))
+        })
+    }
+
+    /// List the entries of a directory. Used by the package cache to reclaim
+    /// staging files on startup.
+    #[cfg(feature = "native-io")]
+    fn list_dir<'a>(&'a mut self, path: &'a Path) -> BoxFuture<'a, Result<Vec<PathBuf>>> {
+        Box::pin(async move {
+            let entries = std::fs::read_dir(path)
+                .map_err(|error| crate::Error::Io(path.to_path_buf(), error))?;
+            let mut out = Vec::new();
+            for entry in entries {
+                let entry = entry.map_err(|error| crate::Error::Io(path.to_path_buf(), error))?;
+                out.push(entry.path());
+            }
+            Ok(out)
+        })
+    }
+
+    /// Atomically write `bytes` to `path`, optionally failing at a selected
+    /// boundary. The default implementation performs the file write itself
+    /// (see [`crate::eval::atomic_write`]); only the final directory
+    /// synchronization is delegated to [`Self::sync_directory`].
+    #[cfg(feature = "native-io")]
+    fn write_atomic_faultable<'a>(
+        &'a mut self,
+        path: &'a Path,
+        bytes: &'a [u8],
+        faults: Option<&'a dyn AtomicWriteFaults>,
+        stage: WriteStage,
+    ) -> BoxFuture<'a, Result<()>> {
+        let snapshot = faults.map(|policy| {
+            let mut snap = AtomicWriteFaultsSnapshot::new();
+            for fault in [
+                AtomicWriteFault::Create,
+                AtomicWriteFault::Flush,
+                AtomicWriteFault::FileSync,
+                AtomicWriteFault::Rename,
+                AtomicWriteFault::DirSync,
+            ] {
+                if policy.fault_for(path, stage).is_some_and(|found| found == fault) {
+                    snap = snap.fail(stage, fault);
+                }
+            }
+            snap
+        });
+        Box::pin(async move {
+            crate::eval::atomic_write(path, bytes, snapshot.map(|snap| (snap, stage)))
+                .map_err(|error| crate::Error::Io(path.to_path_buf(), error))?;
+            // Directory sync is part of atomic_write when no DirSync fault is
+            // configured; a DirSync fault is delivered through sync_directory.
+            if snapshot
+                .as_ref()
+                .is_some_and(|snap| snap.has(stage, AtomicWriteFault::DirSync))
+            {
+                if let Some(parent) = path.parent() {
+                    self.sync_directory(parent, faults).await?;
+                }
+            }
+            Ok(())
+        })
+    }
+
+    /// Synchronize a directory (fsync), optionally failing under fault
+    /// injection. Defaults to a no-op for portable in-memory backends.
+    #[cfg(feature = "native-io")]
+    fn sync_directory<'a>(
+        &'a mut self,
+        _path: &'a Path,
+        faults: Option<&'a dyn AtomicWriteFaults>,
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            if let Some(policy) = faults
+                && policy
+                    .fault_for(_path, WriteStage::Metadata)
+                    .is_some_and(|fault| fault == AtomicWriteFault::DirSync)
+            {
+                return Err(crate::Error::Eval(
+                    "injected directory sync failure".to_string(),
+                ));
+            }
+            Ok(())
         })
     }
 

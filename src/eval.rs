@@ -5652,6 +5652,58 @@ fn validate_package_bytes(url: &str, extension: &str, bytes: &[u8]) -> Result<()
 }
 
 pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    atomic_write(path, bytes, None)
+}
+
+/// Boundaries at which a package cache write can be made to fail in tests.
+#[cfg(feature = "native-io")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AtomicWriteFault {
+    /// Creating the staging file fails.
+    Create,
+    /// Writing bytes (flush) fails partway through.
+    Flush,
+    /// `fsync` of the staging file fails.
+    FileSync,
+    /// Renaming the staging file into place fails.
+    Rename,
+    /// `fsync` of the containing directory fails.
+    DirSync,
+}
+
+/// Which payload is being written at a failure boundary.
+#[cfg(feature = "native-io")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteStage {
+    /// Immutable content-addressed package blob.
+    Blob,
+    /// Atomic metadata commit record.
+    Metadata,
+}
+
+#[cfg(feature = "native-io")]
+fn fault_io_error(fault: AtomicWriteFault) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::Other,
+        match fault {
+            AtomicWriteFault::Create => "injected staging file create failure",
+            AtomicWriteFault::Flush => "injected flush failure",
+            AtomicWriteFault::FileSync => "injected file sync failure",
+            AtomicWriteFault::Rename => "injected rename failure",
+            AtomicWriteFault::DirSync => "injected directory sync failure",
+        },
+    )
+}
+
+#[cfg(feature = "native-io")]
+pub(crate) fn atomic_write(
+    path: &Path,
+    bytes: &[u8],
+    injected: Option<(
+        crate::capabilities::AtomicWriteFaultsSnapshot,
+        WriteStage,
+    )>,
+) -> std::io::Result<()> {
     use std::io::Write;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -5665,30 +5717,67 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         std::process::id(),
         COUNTER.fetch_add(1, Ordering::Relaxed)
     ));
+
+    if let Some((faults, stage)) = &injected
+        && faults.has(*stage, AtomicWriteFault::Create)
+    {
+        return Err(fault_io_error(AtomicWriteFault::Create));
+    }
+
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&temp_path)?;
+
+    if let Some((faults, stage)) = &injected
+        && faults.has(*stage, AtomicWriteFault::Flush)
+    {
+        // Simulate a write that dies mid-stream: leave the partially written
+        // staging file on disk like a process crash. Startup sweep reclaims it.
+        if !bytes.is_empty() {
+            let _ = file.write_all(&bytes[..bytes.len() / 2 + 1]);
+        }
+        drop(file);
+        return Err(fault_io_error(AtomicWriteFault::Flush));
+    }
+
+    if let Some((faults, stage)) = &injected
+        && faults.has(*stage, AtomicWriteFault::FileSync)
+    {
+        file.write_all(bytes)?;
+        drop(file);
+        return Err(fault_io_error(AtomicWriteFault::FileSync));
+    }
+
     let write_result = file.write_all(bytes).and_then(|()| file.sync_all());
     drop(file);
     if let Err(error) = write_result {
         let _ = std::fs::remove_file(&temp_path);
         return Err(error);
     }
+
+    if let Some((faults, stage)) = &injected
+        && faults.has(*stage, AtomicWriteFault::Rename)
+    {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(fault_io_error(AtomicWriteFault::Rename));
+    }
+
     let rename_result = match std::fs::rename(&temp_path, path) {
-        Ok(()) => return Ok(()),
+        Ok(()) => (),
         // Windows rename does not replace an existing file. There is a brief
         // non-atomic gap on that platform, but the destination must not retain
-        // stale bytes while its URL sidecar is updated.
+        // stale bytes while its metadata is updated.
         Err(_) if path.exists() => {
-            std::fs::remove_file(path).and_then(|()| std::fs::rename(&temp_path, path))
+            std::fs::remove_file(path).and_then(|()| std::fs::rename(&temp_path, path))?;
         }
-        Err(error) => Err(error),
+        Err(error) => {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(error);
+        }
     };
-    if rename_result.is_err() {
-        let _ = std::fs::remove_file(temp_path);
-    }
-    rename_result
+
+    Ok(())
 }
 
 /// Resolve a `package://` URI to a download source.
