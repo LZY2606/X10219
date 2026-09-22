@@ -36,6 +36,10 @@ pub struct Evaluator {
     package_dirs: HashMap<String, PathBuf>,
     /// Directory used to persist downloaded package content across evaluators.
     package_cache_dir: Option<PathBuf>,
+    /// Whether stale staging files from a crashed write have been swept.
+    cache_swept: bool,
+    /// Monotonic counter for unique staging file names within one evaluator.
+    staging_counter: usize,
     /// HTTP URL roots whose sources belong to direct-download packages.
     package_http_roots: HashSet<String>,
     /// Whether network access is disabled for this evaluator.
@@ -90,6 +94,8 @@ impl Default for Evaluator {
             #[cfg(feature = "package-zip-core")]
             package_dirs: HashMap::new(),
             package_cache_dir: None,
+            cache_swept: false,
+            staging_counter: 0,
             package_http_roots: HashSet::new(),
             offline: false,
             http_rewrites: Vec::new(),
@@ -125,6 +131,8 @@ impl Evaluator {
             #[cfg(feature = "package-zip-core")]
             package_dirs: HashMap::new(),
             package_cache_dir: None,
+            cache_swept: false,
+            staging_counter: 0,
             package_http_roots: HashSet::new(),
             offline: false,
             http_rewrites: Vec::new(),
@@ -452,54 +460,135 @@ impl Evaluator {
     }
 
     async fn read_package_cache(&mut self, url: &str, extension: &str) -> Result<Option<Vec<u8>>> {
+        self.ensure_cache_swept().await?;
         let Some(cache_dir) = &self.package_cache_dir else {
             return Ok(None);
         };
-        let (data_path, url_path) = package_cache_paths(cache_dir, url, extension);
-        let cached_url = match self.capabilities.read_to_string(&url_path).await {
-            Ok(cached_url) => cached_url,
+        let (meta_path, _blob_name, _blob_dir) = package_cache_paths(cache_dir, url, extension);
+        let meta_text = match self.capabilities.read_to_string(&meta_path).await {
+            Ok(meta_text) => meta_text,
             Err(Error::Io(_, error)) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(None);
             }
             Err(error) => return Err(error),
         };
-        if cached_url != url {
-            return Ok(None);
+        let meta = CacheMeta::from_json(&meta_text)
+            .map_err(|error| Error::Eval(format!("corrupt package cache metadata for {url}: {error}")))?;
+        if meta.version != PACKAGE_CACHE_VERSION {
+            return Err(Error::Eval(format!(
+                "unsupported package cache version {} for {url} (supported: {})",
+                meta.version, PACKAGE_CACHE_VERSION
+            )));
         }
-        match self.capabilities.read_bytes(&data_path).await {
-            Ok(bytes) => Ok(Some(bytes)),
-            Err(Error::Io(_, error)) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(error),
+        if !is_safe_blob_name(&meta.blob) {
+            return Err(Error::Eval(format!(
+                "package cache metadata for {url} references an out-of-tree blob path: {}",
+                meta.blob
+            )));
         }
+        let blob_path = cache_dir.join("blobs").join(&meta.blob);
+        let bytes = match self.capabilities.read_bytes(&blob_path).await {
+            Ok(bytes) => bytes,
+            Err(Error::Io(_, error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(Error::Eval(format!(
+                    "package cache entry for {url} is missing its blob; refusing a half-file hit"
+                )));
+            }
+            Err(error) => return Err(error),
+        };
+        let actual = package_digest(&bytes);
+        if actual != meta.digest {
+            return Err(Error::Eval(format!(
+                "package cache digest mismatch for {url}: metadata claims {}, blob is {actual}",
+                meta.digest
+            )));
+        }
+        Ok(Some(bytes))
     }
 
-    /// Cache `bytes` for `url`. The fetch path ignores the error; preloading does not.
+    /// Persist `bytes` for `url`. The blob is committed before the metadata
+    /// sidecar, so a crash at any write boundary leaves either the previous
+    /// entry or no entry — never a half-file that could look like a hit.
     async fn write_package_cache(
         &mut self,
         url: &str,
         extension: &str,
         bytes: &[u8],
     ) -> Result<()> {
+        self.ensure_cache_swept().await?;
         let Some(cache_dir) = &self.package_cache_dir else {
             return Ok(());
         };
-        let (data_path, url_path) = package_cache_paths(cache_dir, url, extension);
-        let Some(parent) = data_path.parent() else {
+        let (meta_path, blob_name, _blob_dir) = package_cache_paths(cache_dir, url, extension);
+        let blob_path = cache_dir.join("blobs").join(&blob_name);
+        let Some(meta_dir) = meta_path.parent() else {
             return Ok(());
         };
-        self.capabilities.create_dir_all(parent).await?;
-        self.capabilities.write_atomic(&data_path, bytes).await?;
-        self.capabilities
-            .write_atomic(&url_path, url.as_bytes())
+        let Some(blob_dir) = blob_path.parent() else {
+            return Ok(());
+        };
+        self.capabilities.create_dir_all(blob_dir).await?;
+
+        // Content-addressed blobs are immutable: an existing blob with the
+        // same digest is already durable and must not be rewritten.
+        if !self
+            .capabilities
+            .path_exists(&blob_path)
             .await
+            .unwrap_or(false)
+        {
+            let staged_blob = self.staging_path(blob_dir, &blob_name)?;
+            self.capabilities.create_staged_file(&staged_blob, bytes).await?;
+            self.capabilities.flush_staged_file(&staged_blob).await?;
+            self.capabilities
+                .rename_file(&staged_blob, &blob_path)
+                .await?;
+            self.capabilities.sync_dir(blob_dir).await?;
+        }
+
+        let meta = CacheMeta {
+            version: PACKAGE_CACHE_VERSION,
+            url: url.to_string(),
+            extension: extension.to_string(),
+            digest: package_digest(bytes),
+            blob: blob_name.clone(),
+        };
+        let meta_bytes = meta.to_json_bytes();
+        self.capabilities.create_dir_all(meta_dir).await?;
+        let staged_meta = self.staging_path(
+            meta_dir,
+            meta_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("meta.json"),
+        )?;
+        self.capabilities
+            .create_staged_file(&staged_meta, &meta_bytes)
+            .await?;
+        self.capabilities.flush_staged_file(&staged_meta).await?;
+        self.capabilities
+            .rename_file(&staged_meta, &meta_path)
+            .await?;
+        self.capabilities.sync_dir(meta_dir).await?;
+        Ok(())
+    }
+
+    fn staging_path(&mut self, dir: &Path, target_name: &str) -> Result<PathBuf> {
+        let counter = self.staging_counter;
+        self.staging_counter += 1;
+        Ok(dir.join(format!(
+            "{STAGING_PREFIX}{target_name}.{}-{counter}",
+            std::process::id()
+        )))
     }
 
     /// Seed the persistent package cache with `bytes` for `url`.
     ///
     /// `extension` is `"zip"` for archive packages and `"pkl"` for direct file
     /// downloads. A valid cache entry already present wins, so preloading never
-    /// overrides content fetched from the network. Does nothing when no package
-    /// cache directory is configured.
+    /// overrides content fetched from the network. Invalid metadata (corrupt,
+    /// wrong digest, unsupported version, out-of-tree blob path) is replaced
+    /// rather than trusted. Does nothing when no cache directory is configured.
     pub async fn preload_package_async(
         &mut self,
         url: &str,
@@ -509,10 +598,20 @@ impl Evaluator {
         if self.package_cache_dir.is_none() {
             return Ok(());
         }
-        if let Ok(Some(cached)) = self.read_package_cache(url, extension).await
-            && validate_package_bytes(url, extension, &cached).is_ok()
-        {
-            return Ok(());
+        match self.read_package_cache(url, extension).await {
+            Ok(Some(cached)) if validate_package_bytes(url, extension, &cached).is_ok() => {
+                return Ok(());
+            }
+            Ok(_) => {
+                self.remove_package_cache(url, extension).await;
+            }
+            Err(Error::Io(_, _)) => {
+                self.remove_package_cache(url, extension).await;
+            }
+            Err(error) => {
+                // Hard cache corruption must not be silently accepted.
+                return Err(error);
+            }
         }
         validate_package_bytes(url, extension, bytes)?;
         self.write_package_cache(url, extension, bytes).await
@@ -527,9 +626,38 @@ impl Evaluator {
         let Some(cache_dir) = &self.package_cache_dir else {
             return;
         };
-        let (data_path, url_path) = package_cache_paths(cache_dir, url, extension);
-        let _ = self.capabilities.remove_file(&data_path).await;
-        let _ = self.capabilities.remove_file(&url_path).await;
+        let (meta_path, _blob_name, _blob_dir) = package_cache_paths(cache_dir, url, extension);
+        let _ = self.capabilities.remove_file(&meta_path).await;
+    }
+
+    /// Remove staging files left behind by a crashed or fault-injected write.
+    /// Files directly under `packages/` or `blobs/` whose name starts with the
+    /// staging prefix are staging files; committed entries never use it.
+    /// Returns the number of files reclaimed.
+    pub async fn sweep_package_cache(&mut self) -> Result<usize> {
+        let mut removed = 0;
+        let Some(cache_dir) = self.package_cache_dir.clone() else {
+            return Ok(0);
+        };
+        for subdir in ["packages", "blobs"] {
+            let dir = cache_dir.join(subdir);
+            let names = self.capabilities.list_dir(&dir).await?;
+            for name in names {
+                if name.starts_with(STAGING_PREFIX) {
+                    let _ = self.capabilities.remove_file(&dir.join(&name)).await;
+                    removed += 1;
+                }
+            }
+        }
+        Ok(removed)
+    }
+
+    async fn ensure_cache_swept(&mut self) -> Result<()> {
+        if self.cache_swept {
+            return Ok(());
+        }
+        self.cache_swept = true;
+        self.sweep_package_cache().await.map(|_| ())
     }
 
     /// Download a package zip and extract it to a temp directory.
@@ -5614,17 +5742,103 @@ enum PackageSource {
     Zip(String, String),
 }
 
-fn package_cache_paths(cache_dir: &Path, url: &str, extension: &str) -> (PathBuf, PathBuf) {
+/// On-disk package cache format version supported by this evaluator.
+const PACKAGE_CACHE_VERSION: u32 = 1;
+
+/// File-name prefix for staging files. Committed entries never use it, so the
+/// startup sweep can recognize and reclaim files from an interrupted write.
+const STAGING_PREFIX: &str = ".staging-";
+
+/// Metadata sidecar stored next to each content-addressed package blob.
+struct CacheMeta {
+    version: u32,
+    url: String,
+    extension: String,
+    digest: String,
+    blob: String,
+}
+
+impl CacheMeta {
+    fn from_json(text: &str) -> Result<Self> {
+        let value: serde_json::Value = serde_json::from_str(text)
+            .map_err(|error| Error::Eval(format!("metadata is not valid JSON: {error}")))?;
+        let object = value.as_object().ok_or_else(|| {
+            Error::Eval("metadata is not a JSON object".to_string())
+        })?;
+        let version = object
+            .get("version")
+            .and_then(|value| value.as_u64())
+            .ok_or_else(|| Error::Eval("metadata is missing a numeric `version`".to_string()))?;
+        let take_string = |key: &str| -> Result<String> {
+            object
+                .get(key)
+                .and_then(|value| value.as_str())
+                .map(str::to_string)
+                .ok_or_else(|| Error::Eval(format!("metadata is missing string `{key}`")))
+        };
+        Ok(CacheMeta {
+            version: version as u32,
+            url: take_string("url")?,
+            extension: take_string("extension")?,
+            digest: take_string("digest")?,
+            blob: take_string("blob")?,
+        })
+    }
+
+    fn to_json_bytes(&self) -> Vec<u8> {
+        serde_json::json!({
+            "version": self.version,
+            "url": self.url,
+            "extension": self.extension,
+            "digest": self.digest,
+            "blob": self.blob,
+        })
+        .to_string()
+        .into_bytes()
+    }
+}
+
+/// FNV-1a 64-bit digest of package bytes, hex encoded. It is a cheap,
+/// deterministic integrity check against truncated and corrupted blobs; the
+/// underlying package validation (UTF-8/zip CRC) is still enforced on use.
+pub(crate) fn package_digest(bytes: &[u8]) -> String {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
+/// A safe blob reference is a bare `<digest>.<ext>` name inside the cache's
+/// `blobs/` directory. Anything containing a separator or parent reference
+/// would escape the cache directory and is rejected.
+fn is_safe_blob_name(name: &str) -> bool {
+    let Some((stem, extension)) = name.rsplit_once('.') else {
+        return false;
+    };
+    if !(extension == "zip" || extension == "pkl") {
+        return false;
+    }
+    let path = Path::new(stem);
+    path.components().count() == 1
+        && stem.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && stem.len() == 16
+}
+
+fn package_cache_paths(cache_dir: &Path, url: &str, extension: &str) -> (PathBuf, String, PathBuf) {
     // FNV-1a gives package URLs stable, filesystem-safe names without making
-    // the cache layout depend on platform path rules. The adjacent URL file
-    // detects the extraordinarily unlikely hash collision.
+    // the cache layout depend on platform path rules. The metadata sidecar
+    // stores the source URL and detects the extraordinarily unlikely collision.
     let mut hash = 0xcbf29ce484222325_u64;
     for byte in url.as_bytes() {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(0x100000001b3);
     }
-    let base = cache_dir.join("packages").join(format!("{hash:016x}"));
-    (base.with_extension(extension), base.with_extension("url"))
+    let key = format!("{hash:016x}.{extension}");
+    let meta_path = cache_dir.join("packages").join(format!("{key}.json"));
+    let blob_dir = cache_dir.join("blobs");
+    (meta_path, key, blob_dir)
 }
 
 fn validate_package_bytes(url: &str, extension: &str, bytes: &[u8]) -> Result<()> {

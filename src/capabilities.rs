@@ -81,6 +81,125 @@ pub trait EvalCapabilities: Send + Sync {
         base: &'a Path,
         pattern: &'a str,
     ) -> BoxFuture<'a, Result<Vec<PathBuf>>>;
+
+    /// Create `path` exclusively and stage `bytes` without a durability
+    /// guarantee. This is the first package-cache write boundary; failure
+    /// leaves no file behind.
+    fn create_staged_file<'a>(
+        &'a mut self,
+        path: &'a Path,
+        bytes: &'a [u8],
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move { create_staging_file(path, bytes) })
+    }
+
+    /// Flush the staged file to stable storage. This is the second package
+    /// cache write boundary; the file already contains the staged bytes.
+    fn flush_staged_file<'a>(&'a mut self, path: &'a Path) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move { flush_staging_file(path) })
+    }
+
+    /// Atomically replace `destination` with `source`.
+    fn rename_file<'a>(
+        &'a mut self,
+        source: &'a Path,
+        destination: &'a Path,
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move { rename_cache_file(source, destination) })
+    }
+
+    /// Durability barrier for a directory (fsync on Unix, no-op elsewhere).
+    fn sync_dir<'a>(&'a mut self, dir: &'a Path) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move { sync_directory(dir) })
+    }
+
+    /// List immediate child file names of a directory. A missing directory
+    /// is reported as an empty listing.
+    fn list_dir<'a>(&'a mut self, dir: &'a Path) -> BoxFuture<'a, Result<Vec<String>>> {
+        Box::pin(async move {
+            match std::fs::read_dir(dir) {
+                Ok(entries) => {
+                    let mut names = Vec::new();
+                    for entry in entries {
+                        let entry =
+                            entry.map_err(|error| crate::Error::Io(dir.to_path_buf(), error))?;
+                        names.push(entry.file_name().to_string_lossy().into_owned());
+                    }
+                    Ok(names)
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+                Err(error) => Err(crate::Error::Io(dir.to_path_buf(), error)),
+            }
+        })
+    }
+}
+
+/// Default create boundary: open `path` exclusively and write `bytes`.
+/// A failure removes any partial file so no half-file lingers.
+#[cfg(feature = "eval-core")]
+fn create_staging_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|error| crate::Error::Io(path.to_path_buf(), error))?;
+    let result = file
+        .write_all(bytes)
+        .map_err(|error| crate::Error::Io(path.to_path_buf(), error));
+    drop(file);
+    if result.is_err() {
+        let _ = std::fs::remove_file(path);
+    }
+    result
+}
+
+/// Default flush boundary: `sync_all` the staged file. A failure removes it.
+#[cfg(feature = "eval-core")]
+fn flush_staging_file(path: &Path) -> Result<()> {
+    let file = std::fs::File::open(path)
+        .map_err(|error| crate::Error::Io(path.to_path_buf(), error))?;
+    match file.sync_all() {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            drop(file);
+            let _ = std::fs::remove_file(path);
+            Err(crate::Error::Io(path.to_path_buf(), error))
+        }
+    }
+}
+
+/// Replace `destination` with `source`. On platforms where rename cannot
+/// replace an existing file, remove the destination first (the metadata
+/// sidecar is always committed after its blob, so the window is crash-safe
+/// at the cache-entry level).
+#[cfg(feature = "eval-core")]
+fn rename_cache_file(source: &Path, destination: &Path) -> Result<()> {
+    match std::fs::rename(source, destination) {
+        Ok(()) => Ok(()),
+        Err(_) if destination.exists() => std::fs::remove_file(destination)
+            .and_then(|()| std::fs::rename(source, destination))
+            .map_err(|error| crate::Error::Io(destination.to_path_buf(), error)),
+        Err(error) => Err(crate::Error::Io(destination.to_path_buf(), error)),
+    }
+}
+
+/// Durability barrier for a directory entry. On Unix `sync_all` issues
+/// `fsync` on the directory fd, which persists a rename across crashes.
+#[cfg(feature = "eval-core")]
+fn sync_directory(dir: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        std::fs::File::open(dir)
+            .and_then(|handle| handle.sync_all())
+            .map_err(|error| crate::Error::Io(dir.to_path_buf(), error))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        Ok(())
+    }
 }
 
 #[cfg(feature = "native-io")]

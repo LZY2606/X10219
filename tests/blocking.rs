@@ -61,6 +61,67 @@ impl EvalCapabilities for MemoryCacheCapabilities {
         Box::pin(async { Ok(()) })
     }
 
+    fn create_staged_file<'a>(
+        &'a mut self,
+        path: &'a Path,
+        bytes: &'a [u8],
+    ) -> BoxFuture<'a, pklr::Result<()>> {
+        let mut files = self.files.lock().unwrap();
+        if files.contains_key(path) {
+            return Box::pin(async move {
+                Err(pklr::Error::Io(
+                    path.to_path_buf(),
+                    std::io::Error::from(std::io::ErrorKind::AlreadyExists),
+                ))
+            });
+        }
+        files.insert(path.to_path_buf(), bytes.to_vec());
+        Box::pin(async { Ok(()) })
+    }
+
+    fn flush_staged_file<'a>(&'a mut self, _path: &'a Path) -> BoxFuture<'a, pklr::Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn rename_file<'a>(
+        &'a mut self,
+        source: &'a Path,
+        destination: &'a Path,
+    ) -> BoxFuture<'a, pklr::Result<()>> {
+        let moved = self.files.lock().unwrap().remove(source);
+        let mut files = self.files.lock().unwrap();
+        Box::pin(async move {
+            let bytes = moved.ok_or_else(|| {
+                pklr::Error::Io(
+                    source.to_path_buf(),
+                    std::io::Error::from(std::io::ErrorKind::NotFound),
+                )
+            })?;
+            files.insert(destination.to_path_buf(), bytes);
+            Ok(())
+        })
+    }
+
+    fn sync_dir<'a>(&'a mut self, _dir: &'a Path) -> BoxFuture<'a, pklr::Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn list_dir<'a>(&'a mut self, dir: &'a Path) -> BoxFuture<'a, pklr::Result<Vec<String>>> {
+        let prefix = dir.to_path_buf();
+        let names = self
+            .files
+            .lock()
+            .unwrap()
+            .keys()
+            .filter_map(|path| (path.parent() == Some(&prefix)).then(|| {
+                path.file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+            }))
+            .flatten()
+            .collect();
+        Box::pin(async move { Ok(names) })
+    }
+
     fn read_env<'a>(&'a mut self, _name: &'a str) -> BoxFuture<'a, pklr::Result<Option<String>>> {
         Box::pin(async { Ok(None) })
     }
@@ -339,11 +400,13 @@ fn blocking_preload_uses_custom_capabilities() {
     let files = files.lock().unwrap();
     assert_eq!(files.len(), 2);
     assert!(files.values().any(|value| value == b"answer = 42\n"));
-    assert!(
-        files
-            .values()
-            .any(|value| value == b"https://example.com/pkg@1.0.0.pkl")
-    );
+    let metadata = files
+        .keys()
+        .find(|path| path.extension().and_then(|ext| ext.to_str()) == Some("json"))
+        .expect("metadata sidecar");
+    let metadata_text = String::from_utf8(files[metadata].clone()).unwrap();
+    assert!(metadata_text.contains("https://example.com/pkg@1.0.0.pkl"));
+    assert!(metadata_text.contains("\"version\":1"));
 }
 
 #[test]
