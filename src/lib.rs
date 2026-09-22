@@ -87,6 +87,7 @@ pub struct AsyncEvaluatorBuilder {
     package_cache_dir: Option<std::path::PathBuf>,
     offline: bool,
     preloaded_packages: Vec<PreloadedPackage>,
+    capabilities: Option<Box<dyn EvalCapabilities>>,
 }
 
 /// Extensible builder for synchronous Pkl evaluation.
@@ -98,6 +99,7 @@ pub struct EvaluatorBuilder {
     package_cache_dir: Option<std::path::PathBuf>,
     offline: bool,
     preloaded_packages: Vec<PreloadedPackage>,
+    capabilities: Option<Box<dyn EvalCapabilities>>,
 }
 
 /// Package content a host supplies up front instead of fetching it.
@@ -139,6 +141,14 @@ impl AsyncEvaluatorBuilder {
         self
     }
 
+    /// Install custom host capabilities (virtual filesystem, environment,
+    /// network). This is a dependency-injection seam for embedded and test
+    /// hosts; the evaluation semantics are unchanged.
+    pub fn capabilities(mut self, capabilities: impl EvalCapabilities + 'static) -> Self {
+        self.capabilities = Some(Box::new(capabilities));
+        self
+    }
+
     /// Seed the package cache with content the host already has, instead of
     /// fetching it. Requires [`package_cache_dir`](Self::package_cache_dir).
     pub fn preload_package(
@@ -159,7 +169,10 @@ impl AsyncEvaluatorBuilder {
     ///
     /// A package that fails to preload is skipped and fetched normally.
     pub async fn build(self) -> Evaluator {
-        let mut evaluator = Evaluator::new_async();
+        let mut evaluator = match self.capabilities {
+            Some(capabilities) => Evaluator::with_capabilities_erased(capabilities),
+            None => Evaluator::new_async(),
+        };
         #[cfg(feature = "http")]
         if let Some(client) = self.client {
             evaluator
@@ -209,6 +222,14 @@ impl EvaluatorBuilder {
         self
     }
 
+    /// Install custom host capabilities (virtual filesystem, environment,
+    /// network). When set, the configured HTTP agent is ignored. This is a
+    /// dependency-injection seam; evaluation semantics are unchanged.
+    pub fn capabilities(mut self, capabilities: impl EvalCapabilities + 'static) -> Self {
+        self.capabilities = Some(Box::new(capabilities));
+        self
+    }
+
     /// Persist downloaded `package://` content under `path`.
     pub fn package_cache_dir(mut self, path: impl Into<std::path::PathBuf>) -> Self {
         self.package_cache_dir = Some(path.into());
@@ -238,11 +259,15 @@ impl EvaluatorBuilder {
 
     /// Build a configured evaluator for direct source evaluation.
     pub fn build(self) -> Evaluator {
-        let capabilities = match self.agent {
-            Some(agent) => BlockingCapabilities::with_http_agent(agent),
-            None => BlockingCapabilities::new(),
+        let mut evaluator = match self.capabilities {
+            Some(capabilities) => Evaluator::with_capabilities_erased(capabilities),
+            None => match self.agent {
+                Some(agent) => Evaluator::with_capabilities(
+                    BlockingCapabilities::with_http_agent(agent),
+                ),
+                None => Evaluator::with_capabilities(BlockingCapabilities::new()),
+            },
         };
-        let mut evaluator = Evaluator::with_capabilities(capabilities);
         evaluator.set_http_rewrites(&self.http_rewrites);
         if let Some(cache_dir) = self.package_cache_dir {
             evaluator.set_package_cache_dir(cache_dir);

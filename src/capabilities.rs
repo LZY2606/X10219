@@ -51,6 +51,54 @@ pub trait EvalCapabilities: Send + Sync {
         })
     }
 
+    /// Atomically write `bytes` to `path`, yielding at each durability boundary.
+    ///
+    /// `phase` names the boundary that just completed: `"flush"` after the
+    /// body was written and synced, `"rename"` after the staging file was
+    /// renamed into place, and `"sync"` after the containing directory was
+    /// synced. Hosts that inject failures at these boundaries can test the
+    /// evaluator's partial-write recovery without relying on a real filesystem.
+    fn stage_write<'a>(
+        &'a mut self,
+        path: &'a Path,
+        bytes: &'a [u8],
+        on_phase: &'a mut dyn FnMut(&str),
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            let result = crate::eval::stage_write_sync(path, bytes, |phase| on_phase(phase));
+            result.map_err(|error| crate::Error::Io(path.to_path_buf(), error))
+        })
+    }
+
+    /// Flush the containing directory of `path` to disk (fsync on Unix).
+    fn sync_dir<'a>(&'a mut self, path: &'a Path) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            crate::eval::sync_dir(path).map_err(|error| crate::Error::Io(path.to_path_buf(), error))
+        })
+    }
+
+    /// List the file names (not full paths) directly inside `path`. A missing
+    /// directory is reported as an empty listing.
+    fn list_dir<'a>(&'a mut self, path: &'a Path) -> BoxFuture<'a, Result<Vec<String>>> {
+        Box::pin(async move {
+            let mut names = Vec::new();
+            match std::fs::read_dir(path) {
+                Ok(entries) => {
+                    for entry in entries {
+                        let entry =
+                            entry.map_err(|error| crate::Error::Io(path.to_path_buf(), error))?;
+                        if let Some(name) = entry.file_name().to_str() {
+                            names.push(name.to_string());
+                        }
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(crate::Error::Io(path.to_path_buf(), error)),
+            }
+            Ok(names)
+        })
+    }
+
     #[cfg(feature = "package-zip-core")]
     fn extract_zip<'a>(
         &'a mut self,

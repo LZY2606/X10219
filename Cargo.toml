@@ -29,6 +29,7 @@ async = ["native-io", "http", "dep:tokio"]
 [dependencies]
 indexmap    = "2"
 miette     = { version = "7", features = ["derive"], optional = true }
+serde       = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror  = "2"
 async-recursion = { version = "1", optional = true }
@@ -54,6 +55,11 @@ required-features = ["async", "package-zip"]
 [[test]]
 name = "blocking"
 required-features = ["blocking"]
+[[test]]
+name = "contract"
+path = "tests/contract.rs"
+required-features = ["async", "package-zip", "blocking"]
+
 
 [profile.dev]
 debug = 1

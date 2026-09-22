@@ -61,6 +61,46 @@ impl EvalCapabilities for MemoryCacheCapabilities {
         Box::pin(async { Ok(()) })
     }
 
+    fn stage_write<'a>(
+        &'a mut self,
+        path: &'a Path,
+        bytes: &'a [u8],
+        on_phase: &'a mut dyn FnMut(&str),
+    ) -> BoxFuture<'a, pklr::Result<()>> {
+        self.files
+            .lock()
+            .unwrap()
+            .insert(path.to_path_buf(), bytes.to_vec());
+        Box::pin(async move {
+            on_phase("flush");
+            on_phase("rename");
+            on_phase("sync");
+            Ok(())
+        })
+    }
+
+    fn sync_dir<'a>(&'a mut self, _path: &'a Path) -> BoxFuture<'a, pklr::Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn list_dir<'a>(&'a mut self, path: &'a Path) -> BoxFuture<'a, pklr::Result<Vec<String>>> {
+        let prefix = path.to_path_buf();
+        let names = self
+            .files
+            .lock()
+            .unwrap()
+            .keys()
+            .filter_map(|candidate| {
+                candidate
+                    .parent()
+                    .filter(|parent| *parent == prefix)
+                    .and(candidate.file_name())
+                    .map(|name| name.to_string_lossy().into_owned())
+            })
+            .collect();
+        Box::pin(async move { Ok(names) })
+    }
+
     fn read_env<'a>(&'a mut self, _name: &'a str) -> BoxFuture<'a, pklr::Result<Option<String>>> {
         Box::pin(async { Ok(None) })
     }
@@ -341,9 +381,12 @@ fn blocking_preload_uses_custom_capabilities() {
     assert!(files.values().any(|value| value == b"answer = 42\n"));
     assert!(
         files
-            .values()
-            .any(|value| value == b"https://example.com/pkg@1.0.0.pkl")
+            .keys()
+            .any(|path| path.extension().is_some_and(|ext| ext == "json"))
     );
+    assert!(files.values().any(|value| {
+        String::from_utf8_lossy(value).contains("https://example.com/pkg@1.0.0.pkl")
+    }));
 }
 
 #[test]

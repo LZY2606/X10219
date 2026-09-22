@@ -55,6 +55,10 @@ pub enum Error {
 
     #[error("Unsupported feature: {0}")]
     Unsupported(String),
+
+    /// A persistent package-cache entry could not be trusted.
+    #[error("corrupt package cache for {url}: {reason}")]
+    CorruptCache { url: String, reason: String },
 }
 
 impl Error {

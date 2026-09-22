@@ -46,6 +46,8 @@ pub struct Evaluator {
     /// Converters extracted from `output.renderer.converters`.
     /// Each entry maps a class name to a converter lambda.
     converters: Vec<(String, Value)>,
+    /// Whether stale staging files in the package cache have been reaped.
+    cache_staging_swept: bool,
     /// Set of (property_name, message) pairs already warned about.
     /// Used to deduplicate `@Deprecated` warnings so a deprecated property
     /// referenced inside a loop or template doesn't flood stderr.
@@ -95,6 +97,7 @@ impl Default for Evaluator {
             http_rewrites: Vec::new(),
             converters: Vec::new(),
             warned_deprecated: std::collections::HashSet::new(),
+            cache_staging_swept: false,
         }
     }
 }
@@ -110,6 +113,29 @@ impl Evaluator {
     #[cfg(feature = "async")]
     pub fn new_async() -> Self {
         Self::with_capabilities(crate::capabilities::NativeCapabilities::new())
+    }
+
+    /// Construct an evaluator from a type-erased set of capabilities.
+    pub(crate) fn with_capabilities_erased(capabilities: Box<dyn EvalCapabilities>) -> Self {
+        Self {
+            base_path: PathBuf::from("."),
+            max_depth: 32,
+            http_cache: HashMap::new(),
+            import_cache: HashMap::new(),
+            module_scopes: HashMap::new(),
+            env_reads: BTreeMap::new(),
+            scoped_imports_in_flight: HashSet::new(),
+            capabilities,
+            #[cfg(feature = "package-zip-core")]
+            package_dirs: HashMap::new(),
+            package_cache_dir: None,
+            package_http_roots: HashSet::new(),
+            offline: false,
+            http_rewrites: Vec::new(),
+            converters: Vec::new(),
+            warned_deprecated: std::collections::HashSet::new(),
+            cache_staging_swept: false,
+        }
     }
 
     pub fn with_capabilities(capabilities: impl EvalCapabilities + 'static) -> Self {
@@ -130,6 +156,7 @@ impl Evaluator {
             http_rewrites: Vec::new(),
             converters: Vec::new(),
             warned_deprecated: std::collections::HashSet::new(),
+            cache_staging_swept: false,
         }
     }
 
@@ -420,17 +447,18 @@ impl Evaluator {
     }
 
     async fn fetch_package_bytes(&mut self, url: &str, extension: &str) -> Result<Vec<u8>> {
+        self.sweep_package_staging().await;
         match self.read_package_cache(url, extension).await {
-            Ok(Some(bytes)) => match validate_package_bytes(url, extension, &bytes) {
-                Ok(()) => return Ok(bytes),
-                Err(error) if self.offline => return Err(error),
-                Err(_) => self.remove_package_cache(url, extension).await,
-            },
+            Ok(Some(bytes)) => return Ok(bytes),
             Ok(None) => {}
             Err(error) if self.offline => return Err(error),
+            Err(Error::CorruptCache { .. }) => {
+                // Corruption must never masquerade as a hit: evict the entry
+                // and fall through to a network refetch while online.
+                self.remove_package_cache(url, extension).await;
+            }
             Err(_) => {
-                // The persistent cache is an optimization while online. If it
-                // is unreadable, fetch from the network and continue without it.
+                // Other unreadable-cache errors are tolerated while online.
             }
         }
         if self.offline {
@@ -455,43 +483,107 @@ impl Evaluator {
         let Some(cache_dir) = &self.package_cache_dir else {
             return Ok(None);
         };
-        let (data_path, url_path) = package_cache_paths(cache_dir, url, extension);
-        let cached_url = match self.capabilities.read_to_string(&url_path).await {
-            Ok(cached_url) => cached_url,
+        let metadata_path = package_cache_metadata_path(&cache_dir, url);
+        let raw_metadata = match self.capabilities.read_bytes(&metadata_path).await {
+            Ok(raw) => raw,
             Err(Error::Io(_, error)) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(None);
             }
             Err(error) => return Err(error),
         };
-        if cached_url != url {
-            return Ok(None);
+        let metadata = parse_package_cache_metadata(url, &raw_metadata)?;
+        if metadata.extension != extension {
+            return Err(Error::CorruptCache {
+                url: url.to_string(),
+                reason: format!(
+                    "metadata extension {} does not match requested {extension}",
+                    metadata.extension
+                ),
+            });
         }
-        match self.capabilities.read_bytes(&data_path).await {
-            Ok(bytes) => Ok(Some(bytes)),
-            Err(Error::Io(_, error)) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(error),
+        let expected_digest =
+            hex_digest_to_bytes(&metadata.sha256).ok_or_else(|| Error::CorruptCache {
+                url: url.to_string(),
+                reason: format!("invalid digest in metadata: {}", metadata.sha256),
+            })?;
+        let blob_path = package_cache_blob_path(cache_dir, &metadata.blob);
+        let bytes = match self.capabilities.read_bytes(&blob_path).await {
+            Ok(bytes) => bytes,
+            Err(Error::Io(_, error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(Error::CorruptCache {
+                    url: url.to_string(),
+                    reason: format!("blob {} referenced by metadata is missing", metadata.blob),
+                });
+            }
+            Err(error) => return Err(error),
+        };
+        let actual_digest = sha256(&bytes);
+        if actual_digest != expected_digest {
+            return Err(Error::CorruptCache {
+                url: url.to_string(),
+                reason: format!(
+                    "digest mismatch: metadata records {} but content has {}",
+                    metadata.sha256,
+                    hex_encode_digest(&actual_digest)
+                ),
+            });
         }
+        validate_package_bytes(url, extension, &bytes)?;
+        Ok(Some(bytes))
     }
 
     /// Cache `bytes` for `url`. The fetch path ignores the error; preloading does not.
+    ///
+    /// Writes are ordered so a failure at any durability boundary can never
+    /// publish a half entry: the content-addressed blob (fsync + rename +
+    /// directory sync) is published first, and the metadata pointer last.
     async fn write_package_cache(
         &mut self,
         url: &str,
         extension: &str,
         bytes: &[u8],
     ) -> Result<()> {
-        let Some(cache_dir) = &self.package_cache_dir else {
+        let Some(cache_dir) = self.package_cache_dir.clone() else {
             return Ok(());
         };
-        let (data_path, url_path) = package_cache_paths(cache_dir, url, extension);
-        let Some(parent) = data_path.parent() else {
-            return Ok(());
+        self.sweep_package_staging().await;
+        let digest = sha256(bytes);
+        let blob_name = package_cache_blob_name(&digest, extension);
+        let blob_path = package_cache_blob_path(&cache_dir, &blob_name);
+        let metadata_path = package_cache_metadata_path(&cache_dir, url);
+
+        let mut blob_parent = cache_dir.join("blobs");
+        if let Some(parent) = blob_path.parent() {
+            blob_parent = parent.to_path_buf();
+        }
+        self.capabilities.create_dir_all(&blob_parent).await?;
+        let packages_dir = cache_dir.join("packages");
+        self.capabilities.create_dir_all(&packages_dir).await?;
+
+        // The blob is immutable: if a valid one is already present skip it.
+        let blob_exists = matches!(
+            self.capabilities.path_exists(&blob_path).await,
+            Ok(true)
+        );
+        if !blob_exists {
+            self.capabilities
+                .stage_write(&blob_path, bytes, &mut |_| {})
+                .await?;
+        }
+
+        let metadata = PackageCacheMetadata {
+            version: PACKAGE_CACHE_VERSION,
+            url: url.to_string(),
+            extension: extension.to_string(),
+            sha256: hex_encode_digest(&digest),
+            blob: blob_name,
         };
-        self.capabilities.create_dir_all(parent).await?;
-        self.capabilities.write_atomic(&data_path, bytes).await?;
+        let metadata_bytes = serde_json::to_vec_pretty(&metadata)
+            .map_err(|error| Error::Eval(format!("failed to encode package metadata: {error}")))?;
         self.capabilities
-            .write_atomic(&url_path, url.as_bytes())
-            .await
+            .stage_write(&metadata_path, &metadata_bytes, &mut |_| {})
+            .await?;
+        Ok(())
     }
 
     /// Seed the persistent package cache with `bytes` for `url`.
@@ -509,9 +601,9 @@ impl Evaluator {
         if self.package_cache_dir.is_none() {
             return Ok(());
         }
-        if let Ok(Some(cached)) = self.read_package_cache(url, extension).await
-            && validate_package_bytes(url, extension, &cached).is_ok()
-        {
+        self.sweep_package_staging().await;
+        if let Ok(Some(cached)) = self.read_package_cache(url, extension).await {
+            let _ = cached;
             return Ok(());
         }
         validate_package_bytes(url, extension, bytes)?;
@@ -527,9 +619,44 @@ impl Evaluator {
         let Some(cache_dir) = &self.package_cache_dir else {
             return;
         };
-        let (data_path, url_path) = package_cache_paths(cache_dir, url, extension);
-        let _ = self.capabilities.remove_file(&data_path).await;
-        let _ = self.capabilities.remove_file(&url_path).await;
+        let metadata_path = package_cache_metadata_path(&cache_dir, url);
+        if let Ok(raw) = self.capabilities.read_bytes(&metadata_path).await
+            && let Ok(metadata) = parse_package_cache_metadata(url, &raw)
+            && metadata.extension == extension
+        {
+            let _ = self
+                .capabilities
+                .remove_file(&package_cache_blob_path(cache_dir, &metadata.blob))
+                .await;
+        }
+        let _ = self.capabilities.remove_file(&metadata_path).await;
+    }
+
+    /// Delete staging files left behind by a process that crashed or was killed
+    /// while publishing a cache entry. Staging files are never referenced by
+    /// metadata, so they can never be mistaken for cache hits; removing them
+    /// here bounds disk growth and makes recovery observable on next startup.
+    async fn sweep_package_staging(&mut self) {
+        if self.cache_staging_swept {
+            return;
+        }
+        self.cache_staging_swept = true;
+        let Some(cache_dir) = &self.package_cache_dir else {
+            return;
+        };
+        for directory in [cache_dir.join("packages"), cache_dir.join("blobs")] {
+            let Ok(names) = self.capabilities.list_dir(&directory).await else {
+                continue;
+            };
+            for name in names {
+                if name.starts_with(STAGING_PREFIX) {
+                    let _ = self
+                        .capabilities
+                        .remove_file(&directory.join(name))
+                        .await;
+                }
+            }
+        }
     }
 
     /// Download a package zip and extract it to a temp directory.
@@ -5614,17 +5741,124 @@ enum PackageSource {
     Zip(String, String),
 }
 
-fn package_cache_paths(cache_dir: &Path, url: &str, extension: &str) -> (PathBuf, PathBuf) {
-    // FNV-1a gives package URLs stable, filesystem-safe names without making
-    // the cache layout depend on platform path rules. The adjacent URL file
-    // detects the extraordinarily unlikely hash collision.
+/// On-disk package cache format version supported by this build.
+///
+/// Metadata records live at `packages/<fnv(url).hex>.json`, while content is
+/// stored content-addressed at `blobs/<sha256>.<ext>`. A metadata file is only
+/// ever published via an atomic rename, so a partially written entry can never
+/// look like a cache hit.
+const PACKAGE_CACHE_VERSION: u32 = 1;
+const STAGING_PREFIX: &str = ".staging-";
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PackageCacheMetadata {
+    version: u32,
+    url: String,
+    extension: String,
+    /// SHA-256 digest of the cached content, hex-encoded.
+    sha256: String,
+    /// Content-addressed blob file name within the cache's `blobs/` directory.
+    blob: String,
+}
+
+fn fnv1a64(input: &str) -> u64 {
     let mut hash = 0xcbf29ce484222325_u64;
-    for byte in url.as_bytes() {
+    for byte in input.as_bytes() {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(0x100000001b3);
     }
-    let base = cache_dir.join("packages").join(format!("{hash:016x}"));
-    (base.with_extension(extension), base.with_extension("url"))
+    hash
+}
+
+fn package_cache_metadata_path(cache_dir: &Path, url: &str) -> PathBuf {
+    cache_dir
+        .join("packages")
+        .join(format!("{:016x}.json", fnv1a64(url)))
+}
+
+fn package_cache_blob_path(cache_dir: &Path, blob: &str) -> PathBuf {
+    cache_dir.join("blobs").join(blob)
+}
+
+fn package_cache_blob_name(digest: &[u8; 32], extension: &str) -> String {
+    let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    format!("{hex}.{extension}")
+}
+
+fn hex_encode_digest(digest: &[u8; 32]) -> String {
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn hex_digest_to_bytes(hex: &str) -> Option<[u8; 32]> {
+    if hex.len() != 64 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut digest = [0u8; 32];
+    for (index, byte) in digest.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex[index * 2..index * 2 + 2], 16).ok()?;
+    }
+    Some(digest)
+}
+
+/// Reject metadata whose blob reference escapes the cache directory. A valid
+/// blob name is `<64 hex chars>.<extension>` with no path separators.
+fn validate_blob_name(name: &str) -> Result<()> {
+    let Some((digest, extension)) = name.split_once('.') else {
+        return Err(Error::CorruptCache {
+            url: String::new(),
+            reason: format!("blob name has no extension: {name}"),
+        });
+    };
+    if digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(Error::CorruptCache {
+            url: String::new(),
+            reason: format!("blob digest is not 64 hex characters: {name}"),
+        });
+    }
+    if extension.is_empty()
+        || name.contains('/')
+        || name.contains('\\')
+        || name.contains("..")
+        || Path::new(name).components().count() != 1
+    {
+        return Err(Error::CorruptCache {
+            url: String::new(),
+            reason: format!("blob name escapes cache directory: {name}"),
+        });
+    }
+    Ok(())
+}
+
+fn parse_package_cache_metadata(url: &str, raw: &[u8]) -> Result<PackageCacheMetadata> {
+    let metadata: PackageCacheMetadata = serde_json::from_slice(raw).map_err(|error| {
+        Error::CorruptCache {
+            url: url.to_string(),
+            reason: format!("metadata is not valid JSON: {error}"),
+        }
+    })?;
+    if metadata.version != PACKAGE_CACHE_VERSION {
+        return Err(Error::CorruptCache {
+            url: url.to_string(),
+            reason: format!(
+                "unsupported cache version {} (supported: {PACKAGE_CACHE_VERSION})",
+                metadata.version
+            ),
+        });
+    }
+    if metadata.url != url {
+        return Err(Error::CorruptCache {
+            url: url.to_string(),
+            reason: "metadata url does not match requested url".to_string(),
+        });
+    }
+    validate_blob_name(&metadata.blob).map_err(|error| match error {
+        Error::CorruptCache { reason, .. } => Error::CorruptCache {
+            url: url.to_string(),
+            reason,
+        },
+        other => other,
+    })?;
+    Ok(metadata)
 }
 
 fn validate_package_bytes(url: &str, extension: &str, bytes: &[u8]) -> Result<()> {
@@ -5649,6 +5883,195 @@ fn validate_package_bytes(url: &str, extension: &str, bytes: &[u8]) -> Result<()
         }
     }
     Ok(())
+}
+
+/// Minimal dependency-free SHA-256 used to content-address cached packages.
+fn sha256(input: &[u8]) -> [u8; 32] {
+    const K: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+        0xc67178f2,
+    ];
+
+    let mut h: [u32; 8] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+        0x5be0cd19,
+    ];
+
+    let bit_len = u64::try_from(input.len()).unwrap().wrapping_mul(8);
+    let mut padded = input.to_vec();
+    padded.push(0x80);
+    while padded.len() % 64 != 56 {
+        padded.push(0);
+    }
+    padded.extend_from_slice(&bit_len.to_be_bytes());
+
+    for chunk in padded.chunks_exact(64) {
+        let mut words = [0u32; 64];
+        for (index, word) in chunk.chunks_exact(4).enumerate() {
+            words[index] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
+        }
+        for index in 16..64 {
+            let s0 = words[index - 15].rotate_right(7) ^ words[index - 15].rotate_right(18)
+                ^ (words[index - 15] >> 3);
+            let s1 = words[index - 2].rotate_right(17) ^ words[index - 2].rotate_right(19)
+                ^ (words[index - 2] >> 10);
+            words[index] = words[index - 16]
+                .wrapping_add(s0)
+                .wrapping_add(words[index - 7])
+                .wrapping_add(s1);
+        }
+
+        let mut a = h[0];
+        let mut b = h[1];
+        let mut c = h[2];
+        let mut d = h[3];
+        let mut e = h[4];
+        let mut f = h[5];
+        let mut g = h[6];
+        let mut hh = h[7];
+
+        for index in 0..64 {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let ch = (e & f) ^ ((!e) & g);
+            let temp1 = hh
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(K[index])
+                .wrapping_add(words[index]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let temp2 = s0.wrapping_add(maj);
+            hh = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(temp1);
+            d = c;
+            c = b;
+            b = a;
+            a = temp1.wrapping_add(temp2);
+        }
+
+        h[0] = h[0].wrapping_add(a);
+        h[1] = h[1].wrapping_add(b);
+        h[2] = h[2].wrapping_add(c);
+        h[3] = h[3].wrapping_add(d);
+        h[4] = h[4].wrapping_add(e);
+        h[5] = h[5].wrapping_add(f);
+        h[6] = h[6].wrapping_add(g);
+        h[7] = h[7].wrapping_add(hh);
+    }
+
+    let mut digest = [0u8; 32];
+    for (index, value) in h.iter().enumerate() {
+        digest[index * 4..index * 4 + 4].copy_from_slice(&value.to_be_bytes());
+    }
+    digest
+}
+
+/// Write `bytes` atomically, invoking `on_phase` after each durability step so
+/// tests can observe and interrupt the flush/rename/sync boundaries.
+pub(crate) fn stage_write_sync(
+    path: &Path,
+    bytes: &[u8],
+    mut on_phase: impl FnMut(&str),
+) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("cache");
+    let staging = path.with_file_name(format!(
+        "{STAGING_PREFIX}{file_name}-{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&staging)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    drop(file);
+    on_phase("flush");
+
+    match std::fs::rename(&staging, path) {
+        Ok(()) => {}
+        // Windows rename cannot replace an existing file. The content-addressed
+        // blob case is immutable, so a pre-existing destination is treated as
+        // success and the duplicate staging file is discarded.
+        Err(_) if path.exists() => {
+            let _ = std::fs::remove_file(&staging);
+            on_phase("rename");
+            return Ok(());
+        }
+        Err(error) => {
+            let _ = std::fs::remove_file(&staging);
+            return Err(error);
+        }
+    }
+    on_phase("rename");
+
+    if let Some(parent) = path.parent() {
+        sync_dir(parent)?;
+    }
+    on_phase("sync");
+    Ok(())
+}
+
+pub(crate) fn sync_dir(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let dir = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc_o_directory())
+            .open(path)?;
+        use std::os::unix::io::AsRawFd;
+        let result = unsafe { fsync_raw(dir.as_raw_fd()) };
+        let _ = dir.sync_all();
+        result
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn libc_o_directory() -> i32 {
+    // O_DIRECTORY on Linux and macOS; avoid a libc dependency.
+    if cfg!(target_os = "linux") {
+        0o0200000
+    } else if cfg!(target_os = "macos") {
+        0o100000
+    } else {
+        0
+    }
+}
+
+#[cfg(unix)]
+unsafe fn fsync_raw(fd: std::os::unix::io::RawFd) -> std::io::Result<()> {
+    unsafe extern "C" {
+        fn fsync(fd: i32) -> i32;
+    }
+    // SAFETY: `fd` is a valid file descriptor owned by the just-opened dir.
+    if unsafe { fsync(fd) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
 }
 
 pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
