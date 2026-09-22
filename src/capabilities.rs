@@ -51,6 +51,35 @@ pub trait EvalCapabilities: Send + Sync {
         })
     }
 
+    /// Flush a directory entry (for example, after an atomic rename) to disk.
+    ///
+    /// Filesystems without directory fsync semantics can treat this as a no-op.
+    fn sync_dir<'a>(&'a mut self, path: &'a Path) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move { sync_dir_sync(path) })
+    }
+
+    /// List the immediate file names contained in a directory.
+    ///
+    /// Used to discover and reclaim stale temporary files left by an
+    /// interrupted cache write. A missing directory yields an empty list.
+    fn list_dir<'a>(&'a mut self, path: &'a Path) -> BoxFuture<'a, Result<Vec<String>>> {
+        Box::pin(async move {
+            match std::fs::read_dir(path) {
+                Ok(entries) => {
+                    let mut names = Vec::new();
+                    for entry in entries {
+                        let entry =
+                            entry.map_err(|error| crate::Error::Io(path.to_path_buf(), error))?;
+                        names.push(entry.file_name().to_string_lossy().into_owned());
+                    }
+                    Ok(names)
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+                Err(error) => Err(crate::Error::Io(path.to_path_buf(), error)),
+            }
+        })
+    }
+
     #[cfg(feature = "package-zip-core")]
     fn extract_zip<'a>(
         &'a mut self,
@@ -280,6 +309,44 @@ impl EvalCapabilities for NativeCapabilities {
             #[cfg(not(feature = "async"))]
             let result = std::fs::remove_file(path);
             result.map_err(|error| crate::Error::Io(path.to_path_buf(), error))
+        })
+    }
+
+    fn sync_dir<'a>(&'a mut self, path: &'a Path) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            #[cfg(feature = "async")]
+            {
+                if tokio::runtime::Handle::try_current().is_err() {
+                    return sync_dir_sync(path);
+                }
+                let path = path.to_path_buf();
+                tokio::task::spawn_blocking(move || sync_dir_sync(&path))
+                    .await
+                    .map_err(|error| {
+                        crate::Error::Eval(format!("directory sync task failed: {error}"))
+                    })?
+            }
+            #[cfg(not(feature = "async"))]
+            sync_dir_sync(path)
+        })
+    }
+
+    fn list_dir<'a>(&'a mut self, path: &'a Path) -> BoxFuture<'a, Result<Vec<String>>> {
+        Box::pin(async move {
+            #[cfg(feature = "async")]
+            {
+                if tokio::runtime::Handle::try_current().is_err() {
+                    return list_dir_sync(path);
+                }
+                let path = path.to_path_buf();
+                tokio::task::spawn_blocking(move || list_dir_sync(&path))
+                    .await
+                    .map_err(|error| {
+                        crate::Error::Eval(format!("directory listing task failed: {error}"))
+                    })?
+            }
+            #[cfg(not(feature = "async"))]
+            list_dir_sync(path)
         })
     }
 
@@ -545,6 +612,38 @@ fn extract_zip_sync(bytes: Vec<u8>, destination: &Path) -> Result<()> {
         .extract(destination)
         .map_err(|error| crate::Error::Eval(format!("zip extract error: {error}")))?;
     Ok(())
+}
+
+/// Best-effort fsync of a directory file descriptor so a renaming process
+/// crashing immediately afterwards still leaves the new entry on disk.
+fn sync_dir_sync(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let dir = std::fs::File::open(path)
+            .map_err(|error| crate::Error::Io(path.to_path_buf(), error))?;
+        dir.sync_all()
+            .map_err(|error| crate::Error::Io(path.to_path_buf(), error))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
+}
+
+fn list_dir_sync(path: &Path) -> Result<Vec<String>> {
+    match std::fs::read_dir(path) {
+        Ok(entries) => {
+            let mut names = Vec::new();
+            for entry in entries {
+                let entry = entry.map_err(|error| crate::Error::Io(path.to_path_buf(), error))?;
+                names.push(entry.file_name().to_string_lossy().into_owned());
+            }
+            Ok(names)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => Err(crate::Error::Io(path.to_path_buf(), error)),
+    }
 }
 
 #[cfg(all(test, feature = "native-io"))]

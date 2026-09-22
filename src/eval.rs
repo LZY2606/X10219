@@ -36,6 +36,8 @@ pub struct Evaluator {
     package_dirs: HashMap<String, PathBuf>,
     /// Directory used to persist downloaded package content across evaluators.
     package_cache_dir: Option<PathBuf>,
+    /// Whether stale cache temporary files have been reclaimed this evaluator.
+    cache_swept: bool,
     /// HTTP URL roots whose sources belong to direct-download packages.
     package_http_roots: HashSet<String>,
     /// Whether network access is disabled for this evaluator.
@@ -90,6 +92,7 @@ impl Default for Evaluator {
             #[cfg(feature = "package-zip-core")]
             package_dirs: HashMap::new(),
             package_cache_dir: None,
+            cache_swept: false,
             package_http_roots: HashSet::new(),
             offline: false,
             http_rewrites: Vec::new(),
@@ -125,6 +128,7 @@ impl Evaluator {
             #[cfg(feature = "package-zip-core")]
             package_dirs: HashMap::new(),
             package_cache_dir: None,
+            cache_swept: false,
             package_http_roots: HashSet::new(),
             offline: false,
             http_rewrites: Vec::new(),
@@ -452,46 +456,146 @@ impl Evaluator {
     }
 
     async fn read_package_cache(&mut self, url: &str, extension: &str) -> Result<Option<Vec<u8>>> {
-        let Some(cache_dir) = &self.package_cache_dir else {
+        let Some(cache_dir) = self.package_cache_dir.clone() else {
             return Ok(None);
         };
-        let (data_path, url_path) = package_cache_paths(cache_dir, url, extension);
-        let cached_url = match self.capabilities.read_to_string(&url_path).await {
-            Ok(cached_url) => cached_url,
+        self.sweep_package_cache().await?;
+        let meta_path = package_meta_path(&cache_dir, url);
+        let meta_text = match self.capabilities.read_to_string(&meta_path).await {
+            Ok(text) => text,
             Err(Error::Io(_, error)) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(None);
             }
             Err(error) => return Err(error),
         };
+        let metadata: serde_json::Value = serde_json::from_str(&meta_text).map_err(|error| {
+            Error::Eval(format!(
+                "corrupt package cache metadata for {url}: {error}"
+            ))
+        })?;
+        let meta_version = metadata
+            .get("version")
+            .and_then(|value| value.as_i64())
+            .ok_or_else(|| Error::Eval(format!("package cache metadata for {url} has no version")))?;
+        if meta_version != PACKAGE_CACHE_VERSION as i64 {
+            return Err(Error::Eval(format!(
+                "unsupported package cache version {meta_version} for {url} (supported: {})",
+                PACKAGE_CACHE_VERSION
+            )));
+        }
+        let cached_url = metadata
+            .get("url")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| Error::Eval(format!("package cache metadata for {url} has no url")))?;
         if cached_url != url {
+            // Hash collisions or a re-keyed slot are treated as an ordinary miss.
             return Ok(None);
         }
-        match self.capabilities.read_bytes(&data_path).await {
-            Ok(bytes) => Ok(Some(bytes)),
-            Err(Error::Io(_, error)) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(error),
+        let cached_extension = metadata
+            .get("extension")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| {
+                Error::Eval(format!(
+                    "package cache metadata for {url} has no extension"
+                ))
+            })?;
+        if cached_extension != extension {
+            return Ok(None);
         }
+        let expected_digest = metadata
+            .get("sha256")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| {
+                Error::Eval(format!(
+                    "package cache metadata for {url} has no sha256 digest"
+                ))
+            })?;
+        let blob_rel = metadata
+            .get("blob")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| Error::Eval(format!("package cache metadata for {url} has no blob")))?;
+        if !is_safe_cache_relative_path(blob_rel) {
+            return Err(Error::Eval(format!(
+                "package cache metadata for {url} points outside the cache: {blob_rel}"
+            )));
+        }
+        let blob_path = cache_dir.join(blob_rel);
+        let bytes = match self.capabilities.read_bytes(&blob_path).await {
+            Ok(bytes) => bytes,
+            Err(Error::Io(_, error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        let actual_digest = sha256_hex(&bytes);
+        if actual_digest != expected_digest {
+            return Err(Error::Eval(format!(
+                "package cache digest mismatch for {url}: expected {expected_digest}, found {actual_digest}"
+            )));
+        }
+        Ok(Some(bytes))
     }
 
     /// Cache `bytes` for `url`. The fetch path ignores the error; preloading does not.
+    ///
+    /// The content-addressed blob is written and synced first. Metadata is the
+    /// commit marker: it exists only after both the blob and its containing
+    /// directory are durable, so a half-written entry can never look like a hit.
     async fn write_package_cache(
         &mut self,
         url: &str,
         extension: &str,
         bytes: &[u8],
     ) -> Result<()> {
-        let Some(cache_dir) = &self.package_cache_dir else {
+        let Some(cache_dir) = self.package_cache_dir.clone() else {
             return Ok(());
         };
-        let (data_path, url_path) = package_cache_paths(cache_dir, url, extension);
-        let Some(parent) = data_path.parent() else {
-            return Ok(());
-        };
-        self.capabilities.create_dir_all(parent).await?;
-        self.capabilities.write_atomic(&data_path, bytes).await?;
+        self.sweep_package_cache().await?;
+        let digest = sha256_hex(bytes);
+        let blob_rel = format!("blobs/{digest}.{}", sanitize_extension(extension));
+        let blob_path = cache_dir.join(&blob_rel);
+        let meta_path = package_meta_path(&cache_dir, url);
+        let blobs_dir = cache_dir.join("blobs");
+        let packages_dir = cache_dir.join("packages");
+        self.capabilities.create_dir_all(&blobs_dir).await?;
         self.capabilities
-            .write_atomic(&url_path, url.as_bytes())
-            .await
+            .write_atomic(&blob_path, bytes)
+            .await?;
+        self.capabilities.sync_dir(&blobs_dir).await?;
+        let metadata = serde_json::json!({
+            "version": PACKAGE_CACHE_VERSION,
+            "url": url,
+            "extension": extension,
+            "sha256": digest,
+            "blob": blob_rel,
+        });
+        let meta_bytes = serde_json::to_vec_pretty(&metadata)
+            .expect("package cache metadata serialization cannot fail");
+        self.capabilities.create_dir_all(&packages_dir).await?;
+        self.capabilities.write_atomic(&meta_path, &meta_bytes).await?;
+        self.capabilities.sync_dir(&packages_dir).await
+    }
+
+    /// Reclaim temporary files left behind by an interrupted cache write.
+    ///
+    /// Only files matching the atomic-write naming scheme are removed, and the
+    /// sweep is best effort: other stale content is left untouched.
+    async fn sweep_package_cache(&mut self) -> Result<()> {
+        if self.cache_swept {
+            return Ok(());
+        }
+        if let Some(cache_dir) = self.package_cache_dir.clone() {
+            for dir in [cache_dir.join("packages"), cache_dir.join("blobs")] {
+                let names = self.capabilities.list_dir(&dir).await?;
+                for name in names {
+                    if is_cache_temp_name(&name) {
+                        let _ = self.capabilities.remove_file(&dir.join(&name)).await;
+                    }
+                }
+            }
+        }
+        self.cache_swept = true;
+        Ok(())
     }
 
     /// Seed the persistent package cache with `bytes` for `url`.
@@ -524,12 +628,14 @@ impl Evaluator {
     }
 
     async fn remove_package_cache(&mut self, url: &str, extension: &str) {
-        let Some(cache_dir) = &self.package_cache_dir else {
+        let Some(cache_dir) = self.package_cache_dir.clone() else {
             return;
         };
-        let (data_path, url_path) = package_cache_paths(cache_dir, url, extension);
-        let _ = self.capabilities.remove_file(&data_path).await;
-        let _ = self.capabilities.remove_file(&url_path).await;
+        let _ = self
+            .capabilities
+            .remove_file(&package_meta_path(&cache_dir, url))
+            .await;
+        let _ = extension;
     }
 
     /// Download a package zip and extract it to a temp directory.
