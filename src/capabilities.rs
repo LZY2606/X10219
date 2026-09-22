@@ -51,6 +51,87 @@ pub trait EvalCapabilities: Send + Sync {
         })
     }
 
+    /// Create a brand-new file exclusively (`O_CREAT | O_EXCL | O_WRONLY`) and
+    /// write `bytes`, without renaming it into place. Used by the package cache
+    /// so staged blobs and metadata can be crash-tested independently.
+    fn cache_write_new<'a>(
+        &'a mut self,
+        path: &'a Path,
+        bytes: &'a [u8],
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+                .map_err(|error| crate::Error::Io(path.to_path_buf(), error))?;
+            file.write_all(bytes)
+                .map_err(|error| crate::Error::Io(path.to_path_buf(), error))
+        })
+    }
+
+    /// Flush a file's previously written contents to stable storage.
+    fn cache_sync_file<'a>(&'a mut self, path: &'a Path) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .open(path)
+                .map_err(|error| crate::Error::Io(path.to_path_buf(), error))?;
+            file.sync_all()
+                .map_err(|error| crate::Error::Io(path.to_path_buf(), error))
+        })
+    }
+
+    /// Rename a staged cache file over its final name.
+    fn cache_rename<'a>(
+        &'a mut self,
+        from: &'a Path,
+        to: &'a Path,
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            std::fs::rename(from, to)
+                .map_err(|error| crate::Error::Io(to.to_path_buf(), error))
+        })
+    }
+
+    /// Flush a directory entry (after a rename or temp-file cleanup).
+    fn cache_sync_dir<'a>(&'a mut self, path: &'a Path) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            let dir = std::fs::OpenOptions::new()
+                .read(true)
+                .open(path)
+                .map_err(|error| crate::Error::Io(path.to_path_buf(), error))?;
+            dir.sync_all()
+                .map_err(|error| crate::Error::Io(path.to_path_buf(), error))
+        })
+    }
+
+    /// List the immediate contents (files and directories) of a directory.
+    fn cache_list_dir<'a>(
+        &'a mut self,
+        path: &'a Path,
+    ) -> BoxFuture<'a, Result<Vec<PathBuf>>> {
+        Box::pin(async move {
+            let entries = std::fs::read_dir(path)
+                .map_err(|error| crate::Error::Io(path.to_path_buf(), error))?;
+            let mut out = Vec::new();
+            for entry in entries {
+                let entry = entry.map_err(|error| crate::Error::Io(path.to_path_buf(), error))?;
+                out.push(entry.path());
+            }
+            Ok(out)
+        })
+    }
+
+    /// Remove a directory tree (used to evict invalid cache entries).
+    fn cache_remove_dir_all<'a>(&'a mut self, path: &'a Path) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            std::fs::remove_dir_all(path)
+                .map_err(|error| crate::Error::Io(path.to_path_buf(), error))
+        })
+    }
+
     #[cfg(feature = "package-zip-core")]
     fn extract_zip<'a>(
         &'a mut self,
@@ -280,6 +361,133 @@ impl EvalCapabilities for NativeCapabilities {
             #[cfg(not(feature = "async"))]
             let result = std::fs::remove_file(path);
             result.map_err(|error| crate::Error::Io(path.to_path_buf(), error))
+        })
+    }
+
+    fn cache_write_new<'a>(
+        &'a mut self,
+        path: &'a Path,
+        bytes: &'a [u8],
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            #[cfg(feature = "async")]
+            {
+                if tokio::runtime::Handle::try_current().is_err() {
+                    return cache_write_new_sync(path, bytes);
+                }
+                let path = path.to_path_buf();
+                let bytes = bytes.to_vec();
+                tokio::task::spawn_blocking(move || cache_write_new_sync(&path, &bytes))
+                    .await
+                    .map_err(|error| {
+                        crate::Error::Eval(format!("cache write task failed: {error}"))
+                    })?
+            }
+            #[cfg(not(feature = "async"))]
+            cache_write_new_sync(path, bytes)
+        })
+    }
+
+    fn cache_sync_file<'a>(&'a mut self, path: &'a Path) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            #[cfg(feature = "async")]
+            {
+                if tokio::runtime::Handle::try_current().is_err() {
+                    return cache_sync_file_sync(path);
+                }
+                let path = path.to_path_buf();
+                tokio::task::spawn_blocking(move || cache_sync_file_sync(&path))
+                    .await
+                    .map_err(|error| {
+                        crate::Error::Eval(format!("cache sync task failed: {error}"))
+                    })?
+            }
+            #[cfg(not(feature = "async"))]
+            cache_sync_file_sync(path)
+        })
+    }
+
+    fn cache_rename<'a>(
+        &'a mut self,
+        from: &'a Path,
+        to: &'a Path,
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            #[cfg(feature = "async")]
+            {
+                if tokio::runtime::Handle::try_current().is_err() {
+                    return cache_rename_sync(from, to);
+                }
+                let from = from.to_path_buf();
+                let to = to.to_path_buf();
+                tokio::task::spawn_blocking(move || cache_rename_sync(&from, &to))
+                    .await
+                    .map_err(|error| {
+                        crate::Error::Eval(format!("cache rename task failed: {error}"))
+                    })?
+            }
+            #[cfg(not(feature = "async"))]
+            cache_rename_sync(from, to)
+        })
+    }
+
+    fn cache_sync_dir<'a>(&'a mut self, path: &'a Path) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            #[cfg(feature = "async")]
+            {
+                if tokio::runtime::Handle::try_current().is_err() {
+                    return cache_sync_dir_sync(path);
+                }
+                let path = path.to_path_buf();
+                tokio::task::spawn_blocking(move || cache_sync_dir_sync(&path))
+                    .await
+                    .map_err(|error| {
+                        crate::Error::Eval(format!("cache dir sync task failed: {error}"))
+                    })?
+            }
+            #[cfg(not(feature = "async"))]
+            cache_sync_dir_sync(path)
+        })
+    }
+
+    fn cache_list_dir<'a>(
+        &'a mut self,
+        path: &'a Path,
+    ) -> BoxFuture<'a, Result<Vec<PathBuf>>> {
+        Box::pin(async move {
+            #[cfg(feature = "async")]
+            {
+                if tokio::runtime::Handle::try_current().is_err() {
+                    return cache_list_dir_sync(path);
+                }
+                let path = path.to_path_buf();
+                tokio::task::spawn_blocking(move || cache_list_dir_sync(&path))
+                    .await
+                    .map_err(|error| {
+                        crate::Error::Eval(format!("cache list task failed: {error}"))
+                    })?
+            }
+            #[cfg(not(feature = "async"))]
+            cache_list_dir_sync(path)
+        })
+    }
+
+    fn cache_remove_dir_all<'a>(&'a mut self, path: &'a Path) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            #[cfg(feature = "async")]
+            {
+                if tokio::runtime::Handle::try_current().is_err() {
+                    return cache_remove_dir_all_sync(path);
+                }
+                let path = path.to_path_buf();
+                tokio::task::spawn_blocking(move || cache_remove_dir_all_sync(&path))
+                    .await
+                    .map_err(|error| {
+                        crate::Error::Eval(format!("cache remove task failed: {error}"))
+                    })?
+            }
+            #[cfg(not(feature = "async"))]
+            cache_remove_dir_all_sync(path)
         })
     }
 
@@ -590,4 +798,58 @@ mod tests {
                 .unwrap()
         );
     }
+}
+
+#[cfg(feature = "native-io")]
+fn cache_write_new_sync(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|error| crate::Error::Io(path.to_path_buf(), error))?;
+    file.write_all(bytes)
+        .map_err(|error| crate::Error::Io(path.to_path_buf(), error))
+}
+
+#[cfg(feature = "native-io")]
+fn cache_sync_file_sync(path: &Path) -> Result<()> {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .open(path)
+        .map_err(|error| crate::Error::Io(path.to_path_buf(), error))?;
+    file.sync_all()
+        .map_err(|error| crate::Error::Io(path.to_path_buf(), error))
+}
+
+#[cfg(feature = "native-io")]
+fn cache_rename_sync(from: &Path, to: &Path) -> Result<()> {
+    std::fs::rename(from, to).map_err(|error| crate::Error::Io(to.to_path_buf(), error))
+}
+
+#[cfg(feature = "native-io")]
+fn cache_sync_dir_sync(path: &Path) -> Result<()> {
+    let dir = std::fs::OpenOptions::new()
+        .read(true)
+        .open(path)
+        .map_err(|error| crate::Error::Io(path.to_path_buf(), error))?;
+    dir.sync_all()
+        .map_err(|error| crate::Error::Io(path.to_path_buf(), error))
+}
+
+#[cfg(feature = "native-io")]
+fn cache_list_dir_sync(path: &Path) -> Result<Vec<PathBuf>> {
+    let entries = std::fs::read_dir(path)
+        .map_err(|error| crate::Error::Io(path.to_path_buf(), error))?;
+    let mut out = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| crate::Error::Io(path.to_path_buf(), error))?;
+        out.push(entry.path());
+    }
+    Ok(out)
+}
+
+#[cfg(feature = "native-io")]
+fn cache_remove_dir_all_sync(path: &Path) -> Result<()> {
+    std::fs::remove_dir_all(path).map_err(|error| crate::Error::Io(path.to_path_buf(), error))
 }

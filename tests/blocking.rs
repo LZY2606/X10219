@@ -61,6 +61,82 @@ impl EvalCapabilities for MemoryCacheCapabilities {
         Box::pin(async { Ok(()) })
     }
 
+    fn cache_write_new<'a>(
+        &'a mut self,
+        path: &'a Path,
+        bytes: &'a [u8],
+    ) -> BoxFuture<'a, pklr::Result<()>> {
+        let mut files = self.files.lock().unwrap();
+        if files.contains_key(path) {
+            return Box::pin(async {
+                Err(pklr::Error::Io(
+                    path.to_path_buf(),
+                    std::io::Error::from(std::io::ErrorKind::AlreadyExists),
+                ))
+            });
+        }
+        files.insert(path.to_path_buf(), bytes.to_vec());
+        Box::pin(async { Ok(()) })
+    }
+
+    fn cache_sync_file<'a>(&'a mut self, _path: &'a Path) -> BoxFuture<'a, pklr::Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn cache_rename<'a>(
+        &'a mut self,
+        from: &'a Path,
+        to: &'a Path,
+    ) -> BoxFuture<'a, pklr::Result<()>> {
+        let mut files = self.files.lock().unwrap();
+        let bytes = files
+            .remove(from)
+            .ok_or_else(|| {
+                pklr::Error::Io(
+                    from.to_path_buf(),
+                    std::io::Error::from(std::io::ErrorKind::NotFound),
+                )
+            })
+            .unwrap();
+        files.insert(to.to_path_buf(), bytes);
+        Box::pin(async { Ok(()) })
+    }
+
+    fn cache_sync_dir<'a>(&'a mut self, _path: &'a Path) -> BoxFuture<'a, pklr::Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn cache_list_dir<'a>(
+        &'a mut self,
+        path: &'a Path,
+    ) -> BoxFuture<'a, pklr::Result<Vec<PathBuf>>> {
+        let prefix = path.to_path_buf();
+        let entries = self
+            .files
+            .lock()
+            .unwrap()
+            .keys()
+            .filter_map(|candidate| {
+                let parent = candidate.parent()?;
+                if parent == prefix {
+                    Some(candidate.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        Box::pin(async move { Ok(entries) })
+    }
+
+    fn cache_remove_dir_all<'a>(
+        &'a mut self,
+        path: &'a Path,
+    ) -> BoxFuture<'a, pklr::Result<()>> {
+        let prefix = path.to_path_buf();
+        self.files.lock().unwrap().retain(|candidate, _| !candidate.starts_with(&prefix));
+        Box::pin(async { Ok(()) })
+    }
+
     fn read_env<'a>(&'a mut self, _name: &'a str) -> BoxFuture<'a, pklr::Result<Option<String>>> {
         Box::pin(async { Ok(None) })
     }
@@ -339,11 +415,9 @@ fn blocking_preload_uses_custom_capabilities() {
     let files = files.lock().unwrap();
     assert_eq!(files.len(), 2);
     assert!(files.values().any(|value| value == b"answer = 42\n"));
-    assert!(
-        files
-            .values()
-            .any(|value| value == b"https://example.com/pkg@1.0.0.pkl")
-    );
+    assert!(files
+        .keys()
+        .any(|path| path.file_name() == Some(std::ffi::OsStr::new("meta.json"))));
 }
 
 #[test]

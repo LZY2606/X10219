@@ -18,7 +18,7 @@ default = [
 ]
 parse = []
 eval-core = ["parse", "dep:async-recursion", "dep:url"]
-native-io = ["eval-core"]
+native-io = ["eval-core", "dep:sha2"]
 http = ["eval-core", "dep:reqwest"]
 package-zip-core = ["native-io", "dep:zip"]
 package-zip = ["package-zip-core"]
@@ -39,6 +39,7 @@ tokio           = { version = "1", features = ["fs", "rt"], optional = true }
 ureq            = { version = "3", default-features = false, features = ["platform-verifier", "rustls-no-provider"], optional = true }
 zip             = { version = "8", default-features = false, features = ["deflate"], optional = true }
 url             = { version = "2", optional = true }
+sha2            = { version = "0.10", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
@@ -57,3 +58,11 @@ required-features = ["blocking"]
 
 [profile.dev]
 debug = 1
+
+[[test]]
+name = "contract_model"
+required-features = ["async", "package-zip", "blocking"]
+
+[[test]]
+name = "cache_faults"
+required-features = ["async", "package-zip", "blocking"]

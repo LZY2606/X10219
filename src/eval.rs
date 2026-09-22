@@ -36,6 +36,8 @@ pub struct Evaluator {
     package_dirs: HashMap<String, PathBuf>,
     /// Directory used to persist downloaded package content across evaluators.
     package_cache_dir: Option<PathBuf>,
+    /// Whether stale staged cache files have been reclaimed this run.
+    package_cache_swept: bool,
     /// HTTP URL roots whose sources belong to direct-download packages.
     package_http_roots: HashSet<String>,
     /// Whether network access is disabled for this evaluator.
@@ -90,6 +92,7 @@ impl Default for Evaluator {
             #[cfg(feature = "package-zip-core")]
             package_dirs: HashMap::new(),
             package_cache_dir: None,
+            package_cache_swept: false,
             package_http_roots: HashSet::new(),
             offline: false,
             http_rewrites: Vec::new(),
@@ -125,6 +128,7 @@ impl Evaluator {
             #[cfg(feature = "package-zip-core")]
             package_dirs: HashMap::new(),
             package_cache_dir: None,
+            package_cache_swept: false,
             package_http_roots: HashSet::new(),
             offline: false,
             http_rewrites: Vec::new(),
@@ -420,18 +424,36 @@ impl Evaluator {
     }
 
     async fn fetch_package_bytes(&mut self, url: &str, extension: &str) -> Result<Vec<u8>> {
-        match self.read_package_cache(url, extension).await {
-            Ok(Some(bytes)) => match validate_package_bytes(url, extension, &bytes) {
-                Ok(()) => return Ok(bytes),
-                Err(error) if self.offline => return Err(error),
-                Err(_) => self.remove_package_cache(url, extension).await,
-            },
-            Ok(None) => {}
+        if let Some(cache_dir) = self.package_cache_dir.clone()
+            && !self.package_cache_swept
+        {
+            // Reclaim staged files from crashed writes before touching the
+            // cache, so a half-written file is never mistaken for an entry.
+            let _ = crate::package_cache::sweep_staging(self.capabilities.as_mut(), &cache_dir)
+                .await;
+            self.package_cache_swept = true;
+        }
+        let lookup = match self.read_package_cache(url, extension).await {
+            Ok(lookup) => lookup,
             Err(error) if self.offline => return Err(error),
-            Err(_) => {
-                // The persistent cache is an optimization while online. If it
-                // is unreadable, fetch from the network and continue without it.
+            // The persistent cache is an optimization while online: an
+            // unreadable cache must not block fetching from the network.
+            Err(_) => crate::package_cache::CacheLookup::Miss,
+        };
+        match lookup {
+            crate::package_cache::CacheLookup::Hit(bytes) => {
+                validate_package_bytes(url, extension, &bytes)?;
+                return Ok(bytes);
             }
+            crate::package_cache::CacheLookup::Invalid(reason) => {
+                let message = reason.message();
+                if self.offline {
+                    return Err(Error::Eval(message));
+                }
+                // While online, discard the invalid entry transparently.
+                self.remove_package_cache(url, extension).await;
+            }
+            crate::package_cache::CacheLookup::Miss => {}
         }
         if self.offline {
             let cache = self
@@ -451,26 +473,16 @@ impl Evaluator {
         Ok(bytes)
     }
 
-    async fn read_package_cache(&mut self, url: &str, extension: &str) -> Result<Option<Vec<u8>>> {
-        let Some(cache_dir) = &self.package_cache_dir else {
-            return Ok(None);
+    async fn read_package_cache(
+        &mut self,
+        url: &str,
+        extension: &str,
+    ) -> Result<crate::package_cache::CacheLookup> {
+        let Some(cache_dir) = &self.package_cache_dir.clone() else {
+            return Ok(crate::package_cache::CacheLookup::Miss);
         };
-        let (data_path, url_path) = package_cache_paths(cache_dir, url, extension);
-        let cached_url = match self.capabilities.read_to_string(&url_path).await {
-            Ok(cached_url) => cached_url,
-            Err(Error::Io(_, error)) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(None);
-            }
-            Err(error) => return Err(error),
-        };
-        if cached_url != url {
-            return Ok(None);
-        }
-        match self.capabilities.read_bytes(&data_path).await {
-            Ok(bytes) => Ok(Some(bytes)),
-            Err(Error::Io(_, error)) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(error),
-        }
+        crate::package_cache::load_entry(self.capabilities.as_mut(), &cache_dir, url, extension)
+            .await
     }
 
     /// Cache `bytes` for `url`. The fetch path ignores the error; preloading does not.
@@ -480,17 +492,10 @@ impl Evaluator {
         extension: &str,
         bytes: &[u8],
     ) -> Result<()> {
-        let Some(cache_dir) = &self.package_cache_dir else {
+        let Some(cache_dir) = &self.package_cache_dir.clone() else {
             return Ok(());
         };
-        let (data_path, url_path) = package_cache_paths(cache_dir, url, extension);
-        let Some(parent) = data_path.parent() else {
-            return Ok(());
-        };
-        self.capabilities.create_dir_all(parent).await?;
-        self.capabilities.write_atomic(&data_path, bytes).await?;
-        self.capabilities
-            .write_atomic(&url_path, url.as_bytes())
+        crate::package_cache::put_entry(self.capabilities.as_mut(), &cache_dir, url, extension, bytes)
             .await
     }
 
@@ -509,7 +514,8 @@ impl Evaluator {
         if self.package_cache_dir.is_none() {
             return Ok(());
         }
-        if let Ok(Some(cached)) = self.read_package_cache(url, extension).await
+        if let crate::package_cache::CacheLookup::Hit(cached) =
+            self.read_package_cache(url, extension).await?
             && validate_package_bytes(url, extension, &cached).is_ok()
         {
             return Ok(());
@@ -524,12 +530,12 @@ impl Evaluator {
     }
 
     async fn remove_package_cache(&mut self, url: &str, extension: &str) {
-        let Some(cache_dir) = &self.package_cache_dir else {
+        let Some(cache_dir) = &self.package_cache_dir.clone() else {
             return;
         };
-        let (data_path, url_path) = package_cache_paths(cache_dir, url, extension);
-        let _ = self.capabilities.remove_file(&data_path).await;
-        let _ = self.capabilities.remove_file(&url_path).await;
+        let _ =
+            crate::package_cache::evict_entry(self.capabilities.as_mut(), &cache_dir, url, extension)
+                .await;
     }
 
     /// Download a package zip and extract it to a temp directory.
@@ -5612,19 +5618,6 @@ enum PackageSource {
     Direct { url: String, root: String },
     /// Zip archive URL + path within the archive
     Zip(String, String),
-}
-
-fn package_cache_paths(cache_dir: &Path, url: &str, extension: &str) -> (PathBuf, PathBuf) {
-    // FNV-1a gives package URLs stable, filesystem-safe names without making
-    // the cache layout depend on platform path rules. The adjacent URL file
-    // detects the extraordinarily unlikely hash collision.
-    let mut hash = 0xcbf29ce484222325_u64;
-    for byte in url.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    let base = cache_dir.join("packages").join(format!("{hash:016x}"));
-    (base.with_extension(extension), base.with_extension("url"))
 }
 
 fn validate_package_bytes(url: &str, extension: &str, bytes: &[u8]) -> Result<()> {
