@@ -16,7 +16,7 @@ pub use capabilities::EvalCapabilities;
 pub use capabilities::NativeCapabilities;
 pub use error::{Error, Result};
 #[cfg(feature = "eval-core")]
-pub use eval::Evaluator;
+pub use eval::{CacheEvent, Evaluator};
 #[cfg(feature = "eval-core")]
 pub use value::Value;
 

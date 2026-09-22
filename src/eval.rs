@@ -43,6 +43,10 @@ pub struct Evaluator {
     /// HTTP URL rewrite rules (source_prefix → target_prefix).
     /// Longest matching prefix wins.
     http_rewrites: Vec<(String, String)>,
+    /// Whether crash debris under the package cache has been swept this run.
+    cache_temp_swept: bool,
+    /// Optional sink for scheduling-independent semantic events (tests).
+    event_sink: Option<std::sync::Mutex<Box<dyn FnMut(&CacheEvent) + Send>>>,
     /// Converters extracted from `output.renderer.converters`.
     /// Each entry maps a class name to a converter lambda.
     converters: Vec<(String, Value)>,
@@ -51,6 +55,37 @@ pub struct Evaluator {
     /// referenced inside a loop or template doesn't flood stderr.
     warned_deprecated: std::collections::HashSet<(String, Option<String>)>,
 }
+
+/// Semantic, scheduling-independent event emitted by the evaluation pipeline.
+///
+/// This is a test-only observation boundary: the default evaluator ignores
+/// these events, but embedders (and the contract tests) can install a sink to
+/// compare an evaluation trace against a simplified model. Field ordering is
+/// deliberately stable and no thread/task identifiers are recorded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CacheEvent {
+    /// A URL was matched by a rewrite rule before a network/cache operation.
+    Rewrite { from: String, to: String },
+    /// A package blob was found and validated in the persistent cache.
+    PackageCacheHit { url: String },
+    /// A package blob had to be fetched over the network.
+    PackageFetch { url: String },
+    /// A freshly fetched blob was persisted to the package cache.
+    PackageCacheWrite { url: String },
+    /// Cache content was ignored as corrupt, stale, or otherwise invalid.
+    PackageCacheReject { url: String, reason: String },
+    /// A preloaded package filled an empty cache slot.
+    PreloadStore { url: String },
+    /// A preload attempt found a valid cache entry and did nothing.
+    PreloadHit { url: String },
+    /// Leftover atomic-write temp files were reclaimed from the cache.
+    TempSweep { removed: usize },
+    /// An environment variable was read on an actually-evaluated path.
+    EnvRead { name: String },
+    /// A remote module source was fetched over HTTP.
+    HttpFetch { url: String },
+}
+
 
 #[derive(Clone, Default)]
 struct MappingInheritedDefault {
@@ -93,6 +128,8 @@ impl Default for Evaluator {
             package_http_roots: HashSet::new(),
             offline: false,
             http_rewrites: Vec::new(),
+            cache_temp_swept: false,
+            event_sink: None,
             converters: Vec::new(),
             warned_deprecated: std::collections::HashSet::new(),
         }
@@ -128,6 +165,8 @@ impl Evaluator {
             package_http_roots: HashSet::new(),
             offline: false,
             http_rewrites: Vec::new(),
+            cache_temp_swept: false,
+            event_sink: None,
             converters: Vec::new(),
             warned_deprecated: std::collections::HashSet::new(),
         }
@@ -173,6 +212,40 @@ impl Evaluator {
     /// Disable network access. Package imports can still use the persistent cache.
     pub fn set_offline(&mut self, offline: bool) {
         self.offline = offline;
+    }
+
+    /// Install a sink for [`CacheEvent`]s. This is a test-oriented dependency
+    /// injection boundary; it does not change what an evaluation computes.
+    pub fn set_event_sink(&mut self, sink: impl FnMut(&CacheEvent) + Send + 'static) {
+        self.event_sink = Some(std::sync::Mutex::new(Box::new(sink)));
+    }
+
+    pub(crate) fn emit(&mut self, event: CacheEvent) {
+        if let Some(sink) = self.event_sink.as_ref()
+            && let Ok(mut sink) = sink.lock()
+        {
+            sink(&event);
+        }
+    }
+
+    /// Reclaim crash debris (atomic-write temp files) from the package cache.
+    /// Runs once per evaluator, before the first package cache operation.
+    async fn ensure_cache_temp_swept(&mut self) {
+        if self.cache_temp_swept {
+            return;
+        }
+        self.cache_temp_swept = true;
+        if let Some(cache_dir) = &self.package_cache_dir {
+            let packages_dir = cache_dir.join("packages");
+            match self
+                .capabilities
+                .sweep_stale_temp_files(&packages_dir, crate::eval::CACHE_TEMP_MARKER)
+                .await
+            {
+                Ok(removed) => self.emit(CacheEvent::TempSweep { removed }),
+                Err(_) => self.emit(CacheEvent::TempSweep { removed: 0 }),
+            }
+        }
     }
 
     /// Return the environment variables observed by the latest evaluation.
@@ -272,6 +345,9 @@ impl Evaluator {
         } else if let Some(var_name) = uri.strip_prefix("env:") {
             // env: — read environment variable
             let value = self.capabilities.read_env(var_name).await?;
+            self.emit(CacheEvent::EnvRead {
+                name: var_name.to_string(),
+            });
             self.env_reads.insert(var_name.to_string(), value.clone());
             let Some(val) = value else {
                 return Err(Error::Eval(format!(
@@ -314,6 +390,15 @@ impl Evaluator {
                 "offline mode prevented HTTP fetch for {url}"
             )));
         }
+        if fetch_url != url {
+            self.emit(CacheEvent::Rewrite {
+                from: url.to_string(),
+                to: fetch_url.to_string(),
+            });
+        }
+        self.emit(CacheEvent::HttpFetch {
+            url: fetch_url.to_string(),
+        });
         let body = self.capabilities.fetch_text(fetch_url).await?;
         self.http_cache.insert(fetch_url.to_string(), body.clone());
         Ok(body)
@@ -420,17 +505,19 @@ impl Evaluator {
     }
 
     async fn fetch_package_bytes(&mut self, url: &str, extension: &str) -> Result<Vec<u8>> {
+        self.ensure_cache_temp_swept().await;
         match self.read_package_cache(url, extension).await {
-            Ok(Some(bytes)) => match validate_package_bytes(url, extension, &bytes) {
-                Ok(()) => return Ok(bytes),
-                Err(error) if self.offline => return Err(error),
-                Err(_) => self.remove_package_cache(url, extension).await,
-            },
+            Ok(Some(bytes)) => return Ok(bytes),
             Ok(None) => {}
             Err(error) if self.offline => return Err(error),
-            Err(_) => {
+            Err(error) => {
+                self.emit(CacheEvent::PackageCacheReject {
+                    url: url.to_string(),
+                    reason: error.to_string(),
+                });
                 // The persistent cache is an optimization while online. If it
-                // is unreadable, fetch from the network and continue without it.
+                // is unreadable, drop the partial entry and fetch normally.
+                self.remove_package_cache(url, extension).await;
             }
         }
         if self.offline {
@@ -444,33 +531,71 @@ impl Evaluator {
             )));
         }
         let fetch_url = self.rewrite_url(url).into_owned();
+        if fetch_url != url {
+            self.emit(CacheEvent::Rewrite {
+                from: url.to_string(),
+                to: fetch_url.clone(),
+            });
+        }
+        self.emit(CacheEvent::PackageFetch {
+            url: fetch_url.clone(),
+        });
         let bytes = self.capabilities.fetch_bytes(&fetch_url).await?;
         validate_package_bytes(url, extension, &bytes)?;
-        // Best-effort: the bytes are already in hand.
-        let _ = self.write_package_cache(url, extension, &bytes).await;
+        // Best-effort persistence: the bytes are already in hand.
+        if self.write_package_cache(url, extension, &bytes).await.is_ok() {
+            self.emit(CacheEvent::PackageCacheWrite {
+                url: url.to_string(),
+            });
+        }
         Ok(bytes)
     }
 
     async fn read_package_cache(&mut self, url: &str, extension: &str) -> Result<Option<Vec<u8>>> {
-        let Some(cache_dir) = &self.package_cache_dir else {
+        let Some(bytes) = self.read_package_cache_raw(url, extension).await? else {
             return Ok(None);
         };
-        let (data_path, url_path) = package_cache_paths(cache_dir, url, extension);
-        let cached_url = match self.capabilities.read_to_string(&url_path).await {
-            Ok(cached_url) => cached_url,
+        self.emit(CacheEvent::PackageCacheHit {
+            url: url.to_string(),
+        });
+        Ok(Some(bytes))
+    }
+
+    async fn read_package_cache_raw(
+        &mut self,
+        url: &str,
+        extension: &str,
+    ) -> Result<Option<Vec<u8>>> {
+        let Some(cache_dir) = &self.package_cache_dir.clone() else {
+            return Ok(None);
+        };
+        let (data_path, metadata_path) = package_cache_paths(&cache_dir, url, extension);
+        let packages_dir = cache_dir.join("packages");
+        let metadata_bytes = match self.capabilities.read_bytes(&metadata_path).await {
+            Ok(bytes) => bytes,
             Err(Error::Io(_, error)) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(None);
             }
             Err(error) => return Err(error),
         };
-        if cached_url != url {
-            return Ok(None);
+        let metadata = validate_cache_metadata(&metadata_bytes, url, extension, &packages_dir)?;
+        let blob_path = metadata.path.clone().unwrap_or(data_path);
+        let bytes = match self.capabilities.read_bytes(&blob_path).await {
+            Ok(bytes) => bytes,
+            Err(Error::Io(_, error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(Error::Eval(format!(
+                    "package cache blob missing for {url}"
+                )));
+            }
+            Err(error) => return Err(error),
+        };
+        if digest_bytes(&bytes) != metadata.digest {
+            return Err(Error::Eval(format!(
+                "package cache digest mismatch for {url}"
+            )));
         }
-        match self.capabilities.read_bytes(&data_path).await {
-            Ok(bytes) => Ok(Some(bytes)),
-            Err(Error::Io(_, error)) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(error),
-        }
+        validate_package_bytes(url, extension, &bytes)?;
+        Ok(Some(bytes))
     }
 
     /// Cache `bytes` for `url`. The fetch path ignores the error; preloading does not.
@@ -483,14 +608,20 @@ impl Evaluator {
         let Some(cache_dir) = &self.package_cache_dir else {
             return Ok(());
         };
-        let (data_path, url_path) = package_cache_paths(cache_dir, url, extension);
+        let (data_path, metadata_path) = package_cache_paths(cache_dir, url, extension);
         let Some(parent) = data_path.parent() else {
             return Ok(());
         };
         self.capabilities.create_dir_all(parent).await?;
         self.capabilities.write_atomic(&data_path, bytes).await?;
+        let metadata = serde_json::json!({
+            "version": PACKAGE_CACHE_FORMAT_VERSION,
+            "url": url,
+            "extension": extension,
+            "digest": digest_bytes(bytes),
+        });
         self.capabilities
-            .write_atomic(&url_path, url.as_bytes())
+            .write_atomic(&metadata_path, metadata.to_string().as_bytes())
             .await
     }
 
@@ -509,13 +640,21 @@ impl Evaluator {
         if self.package_cache_dir.is_none() {
             return Ok(());
         }
-        if let Ok(Some(cached)) = self.read_package_cache(url, extension).await
+        self.ensure_cache_temp_swept().await;
+        if let Ok(Some(cached)) = self.read_package_cache_raw(url, extension).await
             && validate_package_bytes(url, extension, &cached).is_ok()
         {
+            self.emit(CacheEvent::PreloadHit {
+                url: url.to_string(),
+            });
             return Ok(());
         }
         validate_package_bytes(url, extension, bytes)?;
-        self.write_package_cache(url, extension, bytes).await
+        self.write_package_cache(url, extension, bytes).await?;
+        self.emit(CacheEvent::PreloadStore {
+            url: url.to_string(),
+        });
+        Ok(())
     }
 
     #[cfg(feature = "blocking")]
@@ -527,9 +666,9 @@ impl Evaluator {
         let Some(cache_dir) = &self.package_cache_dir else {
             return;
         };
-        let (data_path, url_path) = package_cache_paths(cache_dir, url, extension);
+        let (data_path, metadata_path) = package_cache_paths(cache_dir, url, extension);
         let _ = self.capabilities.remove_file(&data_path).await;
-        let _ = self.capabilities.remove_file(&url_path).await;
+        let _ = self.capabilities.remove_file(&metadata_path).await;
     }
 
     /// Download a package zip and extract it to a temp directory.
@@ -5616,15 +5755,112 @@ enum PackageSource {
 
 fn package_cache_paths(cache_dir: &Path, url: &str, extension: &str) -> (PathBuf, PathBuf) {
     // FNV-1a gives package URLs stable, filesystem-safe names without making
-    // the cache layout depend on platform path rules. The adjacent URL file
-    // detects the extraordinarily unlikely hash collision.
-    let mut hash = 0xcbf29ce484222325_u64;
-    for byte in url.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
+    // the cache layout depend on platform path rules. The adjacent metadata
+    // file detects hash collisions and content tampering.
+    let hash = fnv1a_64(url.as_bytes());
     let base = cache_dir.join("packages").join(format!("{hash:016x}"));
-    (base.with_extension(extension), base.with_extension("url"))
+    (base.with_extension(extension), base.with_extension("meta.json"))
+}
+
+/// Sidecar recorded next to a cached package blob.
+struct PackageCacheMetadata {
+    /// Metadata format version. Only `1` is understood.
+    version: u32,
+    /// URL the blob was fetched for. Must match the looked-up URL.
+    url: String,
+    /// Extension of the blob (`zip` or `pkl`).
+    extension: String,
+    /// FNV-1a of the blob bytes, hex encoded.
+    digest: String,
+    /// Optional blob override; if present the path must stay in the cache dir.
+    path: Option<PathBuf>,
+}
+
+const PACKAGE_CACHE_FORMAT_VERSION: u32 = 1;
+
+/// Parse and validate a cache entry's metadata sidecar. `packages_dir` bounds
+/// any `path` override: metadata pointing outside the cache directory is
+/// rejected outright.
+fn validate_cache_metadata(
+    metadata_bytes: &[u8],
+    expected_url: &str,
+    expected_extension: &str,
+    packages_dir: &Path,
+) -> Result<PackageCacheMetadata> {
+    let value: serde_json::Value = serde_json::from_slice(metadata_bytes).map_err(|error| {
+        Error::Eval(format!(
+            "package cache metadata is corrupt for {expected_url}: {error}"
+        ))
+    })?;
+    let object = value.as_object().ok_or_else(|| {
+        Error::Eval(format!(
+            "package cache metadata is corrupt for {expected_url}: expected an object"
+        ))
+    })?;
+    let parse_field = |key: &str| -> Result<String> {
+        object
+            .get(key)
+            .and_then(|value| value.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| {
+                Error::Eval(format!(
+                    "package cache metadata is corrupt for {expected_url}: missing field {key}"
+                ))
+            })
+    };
+    let version = object
+        .get("version")
+        .and_then(|value| value.as_u64())
+        .ok_or_else(|| {
+            Error::Eval(format!(
+                "package cache metadata is corrupt for {expected_url}: missing field version"
+            ))
+        })? as u32;
+    let metadata = PackageCacheMetadata {
+        version,
+        url: parse_field("url")?,
+        extension: parse_field("extension")?,
+        digest: parse_field("digest")?,
+        path: object
+            .get("path")
+            .and_then(|value| value.as_str())
+            .map(PathBuf::from),
+    };
+    if metadata.version != PACKAGE_CACHE_FORMAT_VERSION {
+        return Err(Error::Eval(format!(
+            "package cache metadata version {} is unsupported for {expected_url} (supported: {})",
+            metadata.version, PACKAGE_CACHE_FORMAT_VERSION
+        )));
+    }
+    if metadata.url != expected_url {
+        return Err(Error::Eval(format!(
+            "package cache metadata url mismatch for {expected_url}: found {}",
+            metadata.url
+        )));
+    }
+    if metadata.extension != expected_extension {
+        return Err(Error::Eval(format!(
+            "package cache metadata extension mismatch for {expected_url}: found {}",
+            metadata.extension
+        )));
+    }
+    if let Some(override_path) = &metadata.path
+        && !path_is_within(override_path, packages_dir)
+    {
+        return Err(Error::Eval(format!(
+            "package cache metadata path escapes the cache directory for {expected_url}: {}",
+            override_path.display()
+        )));
+    }
+    Ok(metadata)
+}
+
+fn path_is_within(path: &Path, root: &Path) -> bool {
+    path.starts_with(root)
+}
+
+fn digest_bytes(bytes: &[u8]) -> String {
+    format!("{:016x}", fnv1a_64(bytes))
 }
 
 fn validate_package_bytes(url: &str, extension: &str, bytes: &[u8]) -> Result<()> {
@@ -5676,7 +5912,7 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         return Err(error);
     }
     let rename_result = match std::fs::rename(&temp_path, path) {
-        Ok(()) => return Ok(()),
+        Ok(()) => Ok(()),
         // Windows rename does not replace an existing file. There is a brief
         // non-atomic gap on that platform, but the destination must not retain
         // stale bytes while its URL sidecar is updated.
@@ -5686,9 +5922,73 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         Err(error) => Err(error),
     };
     if rename_result.is_err() {
-        let _ = std::fs::remove_file(temp_path);
+        let _ = std::fs::remove_file(&temp_path);
+        return rename_result;
     }
-    rename_result
+    // Persist the directory entry itself. Best effort: the rename is already
+    // durable on most platforms, and syncing a directory is unportable.
+    if let Some(parent) = path.parent() {
+        let _ = sync_directory(parent);
+    }
+    Ok(())
+}
+
+/// Marker shared with [`sweep_stale_temp_files`] and the capability sweep hook.
+pub(crate) const CACHE_TEMP_MARKER: &str = ".tmp-";
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn sync_directory(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    extern "C" {
+        fn fsync(fd: std::os::unix::io::RawFd) -> std::os::raw::c_int;
+    }
+    let dir = std::fs::File::open(path)?;
+    let result = unsafe { fsync(dir.as_raw_fd()) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(any(not(unix), target_os = "macos"))]
+fn sync_directory(_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// Delete leftover atomic-write temp files under `directory` whose name
+/// contains `marker`. Missing directories are a no-op. Returns the number of
+/// files removed.
+pub(crate) fn sweep_stale_temp_files(directory: &Path, marker: &str) -> Result<usize> {
+    let mut removed = 0;
+    let entries = match std::fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(Error::Io(directory.to_path_buf(), error)),
+    };
+    for entry in entries {
+        let Ok(entry) = entry else { continue };
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if name.starts_with('.') && name.contains(marker)
+            && std::fs::remove_file(&path).is_ok()
+        {
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
+/// 64-bit FNV-1a, used for both cache entry naming and content digests.
+pub(crate) fn fnv1a_64(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
 }
 
 /// Resolve a `package://` URI to a download source.

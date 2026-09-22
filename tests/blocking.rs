@@ -337,13 +337,17 @@ fn blocking_preload_uses_custom_capabilities() {
         .unwrap();
 
     let files = files.lock().unwrap();
-    assert_eq!(files.len(), 2);
+    // The cache entry is a blob plus a JSON metadata sidecar.
+    assert!(files.len() >= 2, "expected blob and metadata, got {files:?}");
     assert!(files.values().any(|value| value == b"answer = 42\n"));
-    assert!(
-        files
-            .values()
-            .any(|value| value == b"https://example.com/pkg@1.0.0.pkl")
-    );
+    assert!(files.values().any(|value| {
+        std::str::from_utf8(value)
+            .map(|text| {
+                text.contains("\"url\":\"https://example.com/pkg@1.0.0.pkl\"")
+                    && text.contains("\"version\":1")
+            })
+            .unwrap_or(false)
+    }));
 }
 
 #[test]

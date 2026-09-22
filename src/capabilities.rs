@@ -81,6 +81,20 @@ pub trait EvalCapabilities: Send + Sync {
         base: &'a Path,
         pattern: &'a str,
     ) -> BoxFuture<'a, Result<Vec<PathBuf>>>;
+
+    /// Remove leftover temporary files under `directory` whose name contains
+    /// `marker` (e.g. `.tmp-`). Used once per evaluator run to clean crash
+    /// debris from interrupted atomic cache writes.
+    ///
+    /// The default implementation is portable and best effort: an absent
+    /// directory is a no-op. Embedders with a virtual filesystem override it.
+    fn sweep_stale_temp_files<'a>(
+        &'a mut self,
+        directory: &'a Path,
+        marker: &'a str,
+    ) -> BoxFuture<'a, Result<usize>> {
+        Box::pin(async move { crate::eval::sweep_stale_temp_files(directory, marker) })
+    }
 }
 
 #[cfg(feature = "native-io")]
