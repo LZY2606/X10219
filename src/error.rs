@@ -53,6 +53,10 @@ pub enum Error {
     #[error("Import not found: {0}")]
     ImportNotFound(String),
 
+    #[error("Package cache error: {0}")]
+    #[cfg_attr(feature = "miette-diagnostics", diagnostic())]
+    Cache(String),
+
     #[error("Unsupported feature: {0}")]
     Unsupported(String),
 }
