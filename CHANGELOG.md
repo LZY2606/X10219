@@ -1,0 +1,275 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+## [2.0.5](https://github.com/jdx/pklr/compare/v2.0.4...v2.0.5) - 2026-09-19
+
+### Fixed
+
+- *(eval)* amend inherited entries of untyped mappings instead of replacing them ([#189](https://github.com/jdx/pklr/pull/189))
+
+## [2.0.4](https://github.com/jdx/pklr/compare/v2.0.3...v2.0.4) - 2026-09-14
+
+### Fixed
+
+- *(eval)* preserve lexical scope across object amendments ([#184](https://github.com/jdx/pklr/pull/184))
+
+## [2.0.3](https://github.com/jdx/pklr/compare/v2.0.2...v2.0.3) - 2026-09-14
+
+### Fixed
+
+- *(eval)* preserve partial imports across amendments ([#182](https://github.com/jdx/pklr/pull/182))
+
+## [2.0.2](https://github.com/jdx/pklr/compare/v2.0.1...v2.0.2) - 2026-09-14
+
+### Fixed
+
+- *(lexer)* strip CRLF from multiline strings ([#180](https://github.com/jdx/pklr/pull/180))
+- *(eval)* preserve imports across nested mapping amendments ([#177](https://github.com/jdx/pklr/pull/177))
+
+## [2.0.1](https://github.com/jdx/pklr/compare/v2.0.0...v2.0.1) - 2026-09-12
+
+### Fixed
+
+- *(eval)* keep typed mapping entries and hidden properties faithful to Pkl ([#171](https://github.com/jdx/pklr/pull/171))
+
+## [2.0.0](https://github.com/jdx/pklr/compare/v1.5.1...v2.0.0) - 2026-08-26
+
+### Added
+
+- [**breaking**] make blocking evaluation the default ([#162](https://github.com/jdx/pklr/pull/162))
+
+### Fixed
+
+- *(eval)* support com.github.actions packages ([#164](https://github.com/jdx/pklr/pull/164))
+
+## [1.5.1](https://github.com/jdx/pklr/compare/v1.5.0...v1.5.1) - 2026-08-26
+
+### Fixed
+
+- *(eval)* complete class-as-function semantics ([#161](https://github.com/jdx/pklr/pull/161))
+
+## [1.5.0](https://github.com/jdx/pklr/compare/v1.4.0...v1.5.0) - 2026-08-23
+
+### Added
+
+- add preload_package to seed the package cache ([#157](https://github.com/jdx/pklr/pull/157))
+
+## [1.4.0](https://github.com/jdx/pklr/compare/v1.3.0...v1.4.0) - 2026-08-12
+
+### Added
+
+- persist package downloads for offline evaluation ([#153](https://github.com/jdx/pklr/pull/153))
+
+## [1.3.0](https://github.com/jdx/pklr/compare/v1.2.0...v1.3.0) - 2026-08-03
+
+### Added
+
+- track environment reads during evaluation ([#145](https://github.com/jdx/pklr/pull/145))
+
+## [1.2.0](https://github.com/jdx/pklr/compare/v1.1.3...v1.2.0) - 2026-07-16
+
+### Added
+
+- support parser-only and capability-backed builds ([#131](https://github.com/jdx/pklr/pull/131))
+
+### Fixed
+
+- *(eval)* restore evaluator sync compatibility ([#135](https://github.com/jdx/pklr/pull/135))
+
+## [1.1.3](https://github.com/jdx/pklr/compare/v1.1.2...v1.1.3) - 2026-07-06
+
+### Fixed
+
+- *(eval)* include sibling functions in partial imports ([#129](https://github.com/jdx/pklr/pull/129))
+
+## [1.1.2](https://github.com/jdx/pklr/compare/v1.1.1...v1.1.2) - 2026-07-01
+
+### Fixed
+
+- *(eval)* treat object methods as whole import uses ([#126](https://github.com/jdx/pklr/pull/126))
+
+## [1.1.1](https://github.com/jdx/pklr/compare/v1.1.0...v1.1.1) - 2026-07-01
+
+### Fixed
+
+- *(eval)* track import generic param fields ([#124](https://github.com/jdx/pklr/pull/124))
+- *(eval)* resolve relative imports/amends against a remote base URL ([#112](https://github.com/jdx/pklr/pull/112))
+- *(eval)* bind local lambdas in declaration order in object bodies ([#114](https://github.com/jdx/pklr/pull/114))
+- *(eval)* preserve class identity (type_name) through amendment ([#115](https://github.com/jdx/pklr/pull/115))
+- *(eval)* avoid evaluating unused import fields ([#123](https://github.com/jdx/pklr/pull/123))
+- *(eval)* support filter() on Map/Mapping ([#111](https://github.com/jdx/pklr/pull/111))
+- *(eval)* short-circuit && and || ([#113](https://github.com/jdx/pklr/pull/113))
+
+### Other
+
+- *(deps)* lock file maintenance lockfile maintenance ([#118](https://github.com/jdx/pklr/pull/118))
+
+## [1.1.0](https://github.com/jdx/pklr/compare/v1.0.6...v1.1.0) - 2026-06-14
+
+### Added
+
+- support package://pkl.pkl-lang.org/pkl-pantry ([#108](https://github.com/jdx/pklr/pull/108))
+
+## [1.0.6](https://github.com/jdx/pklr/compare/v1.0.5...v1.0.6) - 2026-06-11
+
+### Fixed
+
+- *(eval)* preserve mapping annotation value types ([#106](https://github.com/jdx/pklr/pull/106))
+
+## [1.0.5](https://github.com/jdx/pklr/compare/v1.0.4...v1.0.5) - 2026-06-11
+
+### Fixed
+
+- *(eval)* harden import glob matching ([#105](https://github.com/jdx/pklr/pull/105))
+- *(eval)* support import glob wildcards ([#103](https://github.com/jdx/pklr/pull/103))
+
+## [1.0.4](https://github.com/jdx/pklr/compare/v1.0.3...v1.0.4) - 2026-06-09
+
+### Fixed
+
+- *(eval)* support rewritten package amends ([#101](https://github.com/jdx/pklr/pull/101))
+
+## [1.0.3](https://github.com/jdx/pklr/compare/v1.0.2...v1.0.3) - 2026-06-09
+
+### Fixed
+
+- *(eval)* support string boolean conversion
+
+## [1.0.2](https://github.com/jdx/pklr/compare/v1.0.1...v1.0.2) - 2026-06-09
+
+### Fixed
+
+- *(eval)* preserve explicit union mapping types ([#95](https://github.com/jdx/pklr/pull/95))
+
+## [1.0.1](https://github.com/jdx/pklr/compare/v1.0.0...v1.0.1) - 2026-06-09
+
+### Fixed
+
+- preserve regex output compatibility ([#93](https://github.com/jdx/pklr/pull/93))
+
+## [1.0.0](https://github.com/jdx/pklr/compare/v0.4.5...v1.0.0) - 2026-06-09
+
+### Fixed
+
+- *(eval)* skip unused imports ([#91](https://github.com/jdx/pklr/pull/91))
+
+## [0.4.5](https://github.com/jdx/pklr/compare/v0.4.4...v0.4.5) - 2026-06-09
+
+### Fixed
+
+- *(eval)* preserve mapping locals ([#88](https://github.com/jdx/pklr/pull/88))
+
+## [0.4.4](https://github.com/jdx/pklr/compare/v0.4.3...v0.4.4) - 2026-06-08
+
+### Fixed
+
+- *(eval)* preserve union mapping defaults ([#86](https://github.com/jdx/pklr/pull/86))
+
+## [0.4.3](https://github.com/jdx/pklr/compare/v0.4.2...v0.4.3) - 2026-05-18
+
+### Fixed
+
+- *(deps)* update rust crate reqwest to 0.13 ([#66](https://github.com/jdx/pklr/pull/66))
+- *(deps)* update rust crate zip to v8 ([#69](https://github.com/jdx/pklr/pull/69))
+
+### Other
+
+- *(deps)* lock file maintenance ([#76](https://github.com/jdx/pklr/pull/76))
+- *(deps)* lock file maintenance ([#73](https://github.com/jdx/pklr/pull/73))
+- *(deps)* lock file maintenance ([#72](https://github.com/jdx/pklr/pull/72))
+- set dev profile debug to 1 ([#71](https://github.com/jdx/pklr/pull/71))
+
+## [0.4.2](https://github.com/jdx/pklr/compare/v0.4.1...v0.4.2) - 2026-04-26
+
+### Fixed
+
+- *(eval)* make @Deprecated lazy — only warn on access ([#58](https://github.com/jdx/pklr/pull/58))
+
+## [0.4.1](https://github.com/jdx/pklr/compare/v0.4.0...v0.4.1) - 2026-04-07
+
+### Fixed
+
+- resolve nullable outer property access and semicolons ([#54](https://github.com/jdx/pklr/pull/54))
+
+## [0.4.0](https://github.com/jdx/pklr/compare/v0.3.0...v0.4.0) - 2026-03-25
+
+### Fixed
+
+- extract converters from amends/extends base modules ([#52](https://github.com/jdx/pklr/pull/52))
+
+## [0.3.0](https://github.com/jdx/pklr/compare/v0.2.2...v0.3.0) - 2026-03-24
+
+### Added
+
+- implement output.renderer.converters support ([#49](https://github.com/jdx/pklr/pull/49))
+
+## [0.2.2](https://github.com/jdx/pklr/compare/v0.2.1...v0.2.2) - 2026-03-24
+
+### Added
+
+- add HTTP URL rewrite support ([#46](https://github.com/jdx/pklr/pull/46))
+
+### Fixed
+
+- strip inherited class definitions from extends and remote amends ([#48](https://github.com/jdx/pklr/pull/48))
+- strip inherited class definitions from amends output ([#45](https://github.com/jdx/pklr/pull/45))
+
+## [0.2.1](https://github.com/jdx/pklr/compare/v0.2.0...v0.2.1) - 2026-03-23
+
+### Added
+
+- expose set_http_client and eval_to_json_with_client ([#43](https://github.com/jdx/pklr/pull/43))
+
+## [0.2.0](https://github.com/jdx/pklr/compare/v0.1.0...v0.2.0) - 2026-03-23
+
+### Added
+
+- support hk.pkl evaluation — output block, class functions, perf ([#41](https://github.com/jdx/pklr/pull/41))
+- enforce open modifier on classes ([#38](https://github.com/jdx/pklr/pull/38))
+- type constraints with runtime enforcement via is/as ([#39](https://github.com/jdx/pklr/pull/39))
+- Set() now deduplicates elements ([#37](https://github.com/jdx/pklr/pull/37))
+- implement is/as type operators ([#35](https://github.com/jdx/pklr/pull/35))
+- type alias declarations (typealias) ([#33](https://github.com/jdx/pklr/pull/33))
+- implement read() and read?() resource readers ([#36](https://github.com/jdx/pklr/pull/36))
+- class inheritance (extends) and super keyword ([#30](https://github.com/jdx/pklr/pull/30))
+- support extends for modules and classes ([#29](https://github.com/jdx/pklr/pull/29))
+- this keyword for self-referencing within objects ([#27](https://github.com/jdx/pklr/pull/27))
+- fully implement annotations (@Deprecated, @ModuleInfo, etc.) ([#25](https://github.com/jdx/pklr/pull/25))
+- late binding for object amendment ([#23](https://github.com/jdx/pklr/pull/23))
+- add import* glob import support ([#21](https://github.com/jdx/pklr/pull/21))
+- support default elements/values in objects and mappings ([#22](https://github.com/jdx/pklr/pull/22))
+- enforce property modifiers (hidden, const, abstract) ([#20](https://github.com/jdx/pklr/pull/20))
+- async evaluator with HTTP/HTTPS/package:// import support ([#17](https://github.com/jdx/pklr/pull/17))
+- add unicode escapes, NaN/Infinity, durations, and data sizes ([#16](https://github.com/jdx/pklr/pull/16))
+- integer division, exponentiation, non-null assertion, pipe operator ([#18](https://github.com/jdx/pklr/pull/18))
+- class definitions, outer keyword — v1 complete ([#15](https://github.com/jdx/pklr/pull/15))
+- v1 part 2 — object amendment, module/annotation skipping, higher-order methods ([#14](https://github.com/jdx/pklr/pull/14))
+- v1 language features ([#13](https://github.com/jdx/pklr/pull/13))
+
+### Fixed
+
+- address merged PR feedback — type aliases, depth guard, dead code ([#40](https://github.com/jdx/pklr/pull/40))
+- address PR #29 feedback — dotted extends, HTTP class injection ([#31](https://github.com/jdx/pklr/pull/31))
+- hk.pkl compatibility — parser and eval improvements ([#32](https://github.com/jdx/pklr/pull/32))
+- add import cache to break circular imports ([#28](https://github.com/jdx/pklr/pull/28))
+- *(parser)* support dotted type names in new expressions ([#26](https://github.com/jdx/pklr/pull/26))
+- *(parser)* skip generic type params in new expressions ([#19](https://github.com/jdx/pklr/pull/19))
+- *(parser)* add ?? operator and fix dynamic key parsing ([#11](https://github.com/jdx/pklr/pull/11))
+- *(test)* address PR #9 review feedback ([#10](https://github.com/jdx/pklr/pull/10))
+- *(eval)* guard integer div/mod against zero, remove unreachable Value::Mapping ([#5](https://github.com/jdx/pklr/pull/5))
+
+### Other
+
+- remove feature list and roadmap from README ([#42](https://github.com/jdx/pklr/pull/42))
+- set MSRV to 1.88 and add cargo msrv verify to CI ([#24](https://github.com/jdx/pklr/pull/24))
+- add CLAUDE.md and document supported pkl subset in README ([#12](https://github.com/jdx/pklr/pull/12))
+- remove status section from README
+- add comprehensive pkl feature test suite ([#9](https://github.com/jdx/pklr/pull/9))
+- *(deps)* add miette, remove unused serde ([#8](https://github.com/jdx/pklr/pull/8))
+- add mise.toml, CI workflow, and communique config ([#6](https://github.com/jdx/pklr/pull/6))

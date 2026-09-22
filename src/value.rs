@@ -1,0 +1,160 @@
+use std::sync::Arc;
+
+use indexmap::IndexMap;
+use serde_json::json;
+
+use crate::parser::{Entry, Expr, TypeExpr};
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct CapturedScope {
+    pub values: IndexMap<String, Value>,
+    pub module_identities: IndexMap<String, String>,
+    pub type_aliases: IndexMap<String, TypeExpr>,
+    pub type_namespace: Option<String>,
+}
+
+/// Captures the original AST entries and scope for an object, enabling
+/// late binding: when this object is amended, its entries can be merged
+/// with the overlay's entries and re-evaluated so that dependent
+/// properties pick up overridden values.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ObjectSource {
+    pub entries: Vec<Entry>,
+    pub scope: IndexMap<String, Value>,
+    /// Whether the class was declared `open` (allows adding new properties)
+    pub is_open: bool,
+    /// The pkl class name this object was instantiated from (e.g., "Step", "Group").
+    /// Used by `output.renderer.converters` to apply type-specific transforms.
+    pub type_name: Option<String>,
+    /// Stable definition-site identity used to distinguish same-named classes.
+    pub(crate) type_identity: Option<String>,
+    /// Parent class names, nearest first. Converters declared for a base class
+    /// also apply to instances of its subclasses.
+    pub parent_type_names: Vec<String>,
+    /// Stable definition-site identities for parent classes, nearest first.
+    pub(crate) parent_type_identities: Vec<String>,
+    /// Canonical module identities for imports captured in `scope`.
+    pub(crate) scope_module_identities: IndexMap<String, String>,
+    /// Type aliases captured alongside `scope` at the object's definition site.
+    pub(crate) scope_type_aliases: IndexMap<String, TypeExpr>,
+    /// Lexical scopes for entries introduced by earlier amendments. `None`
+    /// entries use this object's definition-site `scope`.
+    pub(crate) entry_scopes: Vec<Option<Arc<CapturedScope>>>,
+    /// Property names that produced values when this object was evaluated.
+    /// Kept separate from `scope`, which can contain unrelated same-named
+    /// lexical bindings.
+    pub(crate) evaluated_properties: Vec<String>,
+    /// Possible value type names for mapping entries, e.g. `Step | Group` from
+    /// `Mapping<String, Step | Group>`. Used when amending mappings so bare
+    /// entries inherit the right class template.
+    pub mapping_value_types: Vec<String>,
+    /// Map of property name → optional deprecation message for properties
+    /// annotated with `@Deprecated`. Consulted on field access so the
+    /// warning fires when a deprecated property is *used*, not when the
+    /// containing module is loaded. Crate-private: only the evaluator
+    /// reads/writes this; not part of the public API.
+    pub(crate) deprecated: IndexMap<String, Option<String>>,
+}
+
+/// A pkl runtime value.
+///
+/// Pkl's `Mapping` type (arbitrary key→value) is represented as `Object` when
+/// keys are strings — which is the only case supported by JSON output. All
+/// `new Mapping { ["key"] = ... }` expressions therefore produce `Object`.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum Value {
+    #[default]
+    Null,
+    Bool(bool),
+    Int(i64),
+    Float(f64),
+    String(String),
+    /// Object (ordered string-keyed map). Represents both pkl objects and
+    /// string-keyed Mappings.  The optional [`ObjectSource`] stores the
+    /// original entry definitions so late binding works on amendment.
+    /// The map is Arc-wrapped so cloning a Value::Object is O(1).
+    Object(Arc<IndexMap<String, Value>>, Option<Arc<ObjectSource>>),
+    /// Listing (ordered list).
+    List(Vec<Value>),
+    /// Lambda function: param names + body expression + captured scope values.
+    /// Captures are Arc-wrapped so cloning a Lambda is O(1) even when scopes
+    /// contain many nested Lambdas (e.g. TestMaker with checkPass/checkFail/etc.).
+    Lambda(Vec<String>, Expr, Arc<IndexMap<String, Value>>),
+}
+
+impl Value {
+    pub fn to_json(&self) -> serde_json::Value {
+        match self {
+            Value::Null => serde_json::Value::Null,
+            Value::Bool(b) => json!(b),
+            Value::Int(n) => json!(n),
+            Value::Float(f) => json!(f),
+            Value::String(s) => json!(s),
+            Value::Object(map, _) => {
+                let mut obj = serde_json::Map::new();
+                for (k, v) in map.iter() {
+                    obj.insert(k.clone(), v.to_json());
+                }
+                serde_json::Value::Object(obj)
+            }
+            Value::List(items) => {
+                serde_json::Value::Array(items.iter().map(|v| v.to_json()).collect())
+            }
+            Value::Lambda(..) => json!("<lambda>"),
+        }
+    }
+
+    pub fn as_str(&self) -> Option<&str> {
+        if let Value::String(s) = self {
+            Some(s)
+        } else {
+            None
+        }
+    }
+
+    pub fn as_object_mut(&mut self) -> Option<&mut IndexMap<String, Value>> {
+        if let Value::Object(m, _) = self {
+            Some(Arc::make_mut(m))
+        } else {
+            None
+        }
+    }
+
+    /// Merge `other` into `self`. For objects, other's keys win.
+    pub fn merge(&mut self, other: Value) {
+        match (self, other) {
+            (Value::Object(base, _), Value::Object(overlay, _)) => {
+                let base_map = Arc::make_mut(base);
+                for (k, v) in overlay.iter() {
+                    base_map.insert(k.clone(), v.clone());
+                }
+            }
+            (s, other) => *s = other,
+        }
+    }
+}
+
+impl From<serde_json::Value> for Value {
+    fn from(v: serde_json::Value) -> Self {
+        match v {
+            serde_json::Value::Null => Value::Null,
+            serde_json::Value::Bool(b) => Value::Bool(b),
+            serde_json::Value::Number(n) => {
+                if let Some(i) = n.as_i64() {
+                    Value::Int(i)
+                } else {
+                    Value::Float(n.as_f64().unwrap_or(f64::NAN))
+                }
+            }
+            serde_json::Value::String(s) => Value::String(s),
+            serde_json::Value::Array(a) => Value::List(a.into_iter().map(Value::from).collect()),
+            serde_json::Value::Object(o) => {
+                let mut map = IndexMap::new();
+                for (k, v) in o {
+                    map.insert(k, Value::from(v));
+                }
+                Value::Object(Arc::new(map), None)
+            }
+        }
+    }
+}
