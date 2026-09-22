@@ -7,6 +7,7 @@ use indexmap::IndexMap;
 use std::path::{Path, PathBuf};
 
 use crate::capabilities::EvalCapabilities;
+use crate::package_cache::{CacheFs, PackageCacheStore, RealCacheFs};
 use crate::error::{Error, Result};
 use crate::lexer;
 use crate::parser::{self, BinOp, Entry, Expr, Modifier, Module, Property, StringInterpPart, UnOp};
@@ -36,6 +37,10 @@ pub struct Evaluator {
     package_dirs: HashMap<String, PathBuf>,
     /// Directory used to persist downloaded package content across evaluators.
     package_cache_dir: Option<PathBuf>,
+    /// Filesystem mediating persistent cache reads, commits, and sweeping.
+    package_cache_fs: std::sync::Arc<dyn CacheFs>,
+    /// Lazily opened versioned package cache.
+    package_store: Option<std::sync::Arc<PackageCacheStore>>,
     /// HTTP URL roots whose sources belong to direct-download packages.
     package_http_roots: HashSet<String>,
     /// Whether network access is disabled for this evaluator.
@@ -90,6 +95,8 @@ impl Default for Evaluator {
             #[cfg(feature = "package-zip-core")]
             package_dirs: HashMap::new(),
             package_cache_dir: None,
+            package_cache_fs: std::sync::Arc::new(RealCacheFs),
+            package_store: None,
             package_http_roots: HashSet::new(),
             offline: false,
             http_rewrites: Vec::new(),
@@ -125,6 +132,8 @@ impl Evaluator {
             #[cfg(feature = "package-zip-core")]
             package_dirs: HashMap::new(),
             package_cache_dir: None,
+            package_cache_fs: std::sync::Arc::new(RealCacheFs),
+            package_store: None,
             package_http_roots: HashSet::new(),
             offline: false,
             http_rewrites: Vec::new(),
@@ -168,6 +177,29 @@ impl Evaluator {
     /// Persist downloaded package content under `path`.
     pub fn set_package_cache_dir(&mut self, path: impl Into<PathBuf>) {
         self.package_cache_dir = Some(path.into());
+        self.package_store = None;
+    }
+
+    /// Restricted dependency-injection seam: swap the filesystem that backs
+    /// the persistent package cache without changing evaluation semantics.
+    /// Hidden from the public docs and exempt from semver.
+    #[cfg(feature = "native-io")]
+    #[doc(hidden)]
+    pub fn set_package_cache_fs(&mut self, fs: std::sync::Arc<dyn CacheFs>) {
+        self.package_cache_fs = fs;
+        self.package_store = None;
+    }
+
+    fn package_store(&mut self) -> Result<Option<std::sync::Arc<PackageCacheStore>>> {
+        if let Some(store) = &self.package_store {
+            return Ok(Some(std::sync::Arc::clone(store)));
+        }
+        let Some(dir) = &self.package_cache_dir else {
+            return Ok(None);
+        };
+        let store = PackageCacheStore::open(dir.clone(), std::sync::Arc::clone(&self.package_cache_fs))?;
+        self.package_store = Some(std::sync::Arc::clone(&store));
+        Ok(Some(store))
     }
 
     /// Disable network access. Package imports can still use the persistent cache.

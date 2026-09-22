@@ -4,6 +4,14 @@ pub mod error;
 #[cfg(feature = "eval-core")]
 pub mod eval;
 pub mod lexer;
+/// Versioned persistent package cache plus a restricted filesystem seam.
+///
+/// Hidden from rendered docs and exempt from semver: embedders and the contract
+/// tests supply custom cache filesystems through here. Evaluation semantics are
+/// unchanged.
+#[cfg(feature = "eval-core")]
+#[doc(hidden)]
+pub mod package_cache;
 pub mod parser;
 #[cfg(feature = "eval-core")]
 pub mod value;
