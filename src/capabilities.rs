@@ -51,6 +51,22 @@ pub trait EvalCapabilities: Send + Sync {
         })
     }
 
+    /// List the entries of a directory. Used to recognize and clean up
+    /// interrupted cache writes (temporary files) on startup.
+    fn list_dir<'a>(&'a mut self, path: &'a Path) -> BoxFuture<'a, Result<Vec<PathBuf>>> {
+        Box::pin(async move {
+            let entries =
+                std::fs::read_dir(path).map_err(|error| crate::Error::Io(path.to_path_buf(), error))?;
+            let mut paths = Vec::new();
+            for entry in entries {
+                let entry =
+                    entry.map_err(|error| crate::Error::Io(path.to_path_buf(), error))?;
+                paths.push(entry.path());
+            }
+            Ok(paths)
+        })
+    }
+
     #[cfg(feature = "package-zip-core")]
     fn extract_zip<'a>(
         &'a mut self,
@@ -61,6 +77,17 @@ pub trait EvalCapabilities: Send + Sync {
     }
 
     fn read_env<'a>(&'a mut self, name: &'a str) -> BoxFuture<'a, Result<Option<String>>>;
+
+    /// Read a system property for `prop:` resources. The default preserves
+    /// pklr's established behavior of rejecting property reads; embedders can
+    /// override it to supply their own property source.
+    fn read_prop<'a>(&'a mut self, name: &'a str) -> BoxFuture<'a, Result<Option<String>>> {
+        Box::pin(async move {
+            Err(crate::Error::Eval(format!(
+                "system property not available: {name}"
+            )))
+        })
+    }
 
     fn fetch_text<'a>(&'a mut self, url: &'a str) -> BoxFuture<'a, Result<String>>;
 
