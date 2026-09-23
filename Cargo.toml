@@ -42,10 +42,15 @@ url             = { version = "2", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+pollster = "1"
 
 [[test]]
 name = "integration"
 required-features = ["async", "package-zip"]
+
+[[test]]
+name = "contract"
+required-features = ["async", "blocking", "package-zip"]
 
 [[test]]
 name = "pkl_features"

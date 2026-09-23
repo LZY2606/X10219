@@ -1,5 +1,8 @@
 #[cfg(feature = "eval-core")]
 pub mod capabilities;
+#[cfg(feature = "eval-core")]
+#[doc(hidden)]
+pub mod cache;
 pub mod error;
 #[cfg(feature = "eval-core")]
 pub mod eval;
@@ -87,6 +90,7 @@ pub struct AsyncEvaluatorBuilder {
     package_cache_dir: Option<std::path::PathBuf>,
     offline: bool,
     preloaded_packages: Vec<PreloadedPackage>,
+    custom_capabilities: Option<Box<dyn EvalCapabilities>>,
 }
 
 /// Extensible builder for synchronous Pkl evaluation.
@@ -98,6 +102,7 @@ pub struct EvaluatorBuilder {
     package_cache_dir: Option<std::path::PathBuf>,
     offline: bool,
     preloaded_packages: Vec<PreloadedPackage>,
+    custom_capabilities: Option<Box<dyn EvalCapabilities>>,
 }
 
 /// Package content a host supplies up front instead of fetching it.
@@ -155,17 +160,33 @@ impl AsyncEvaluatorBuilder {
         self
     }
 
+    /// Use custom host capabilities instead of the native implementation.
+    ///
+    /// This is the restricted dependency-injection boundary for embedding and
+    /// contract testing: it does not change evaluation semantics. When set,
+    /// [`http_client`](Self::http_client) is ignored.
+    pub fn capabilities(mut self, capabilities: impl EvalCapabilities + 'static) -> Self {
+        self.custom_capabilities = Some(Box::new(capabilities));
+        self
+    }
+
     /// Build a configured evaluator for direct source evaluation.
     ///
     /// A package that fails to preload is skipped and fetched normally.
     pub async fn build(self) -> Evaluator {
-        let mut evaluator = Evaluator::new_async();
-        #[cfg(feature = "http")]
-        if let Some(client) = self.client {
-            evaluator
-                .set_http_client(client)
-                .expect("native async capabilities accept reqwest clients");
-        }
+        let mut evaluator = match self.custom_capabilities {
+            Some(capabilities) => Evaluator::with_capabilities_erased(capabilities),
+            None => {
+                let mut evaluator = Evaluator::new_async();
+                #[cfg(feature = "http")]
+                if let Some(client) = self.client {
+                    evaluator
+                        .set_http_client(client)
+                        .expect("native async capabilities accept reqwest clients");
+                }
+                evaluator
+            }
+        };
         evaluator.set_http_rewrites(&self.http_rewrites);
         if let Some(cache_dir) = self.package_cache_dir {
             evaluator.set_package_cache_dir(cache_dir);
@@ -236,13 +257,25 @@ impl EvaluatorBuilder {
         self
     }
 
+    /// Use custom host capabilities instead of the blocking implementation.
+    ///
+    /// This is the restricted dependency-injection boundary for embedding and
+    /// contract testing: it does not change evaluation semantics. When set,
+    /// [`http_agent`](Self::http_agent) is ignored.
+    pub fn capabilities(mut self, capabilities: impl EvalCapabilities + 'static) -> Self {
+        self.custom_capabilities = Some(Box::new(capabilities));
+        self
+    }
+
     /// Build a configured evaluator for direct source evaluation.
     pub fn build(self) -> Evaluator {
-        let capabilities = match self.agent {
-            Some(agent) => BlockingCapabilities::with_http_agent(agent),
-            None => BlockingCapabilities::new(),
+        let mut evaluator = match self.custom_capabilities {
+            Some(capabilities) => Evaluator::with_capabilities_erased(capabilities),
+            None => match self.agent {
+                Some(agent) => Evaluator::with_capabilities(BlockingCapabilities::with_http_agent(agent)),
+                None => Evaluator::with_capabilities(BlockingCapabilities::new()),
+            },
         };
-        let mut evaluator = Evaluator::with_capabilities(capabilities);
         evaluator.set_http_rewrites(&self.http_rewrites);
         if let Some(cache_dir) = self.package_cache_dir {
             evaluator.set_package_cache_dir(cache_dir);

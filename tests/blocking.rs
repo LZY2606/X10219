@@ -61,6 +61,54 @@ impl EvalCapabilities for MemoryCacheCapabilities {
         Box::pin(async { Ok(()) })
     }
 
+    fn cache_write_temp<'a>(
+        &'a mut self,
+        path: &'a Path,
+        bytes: &'a [u8],
+    ) -> BoxFuture<'a, pklr::Result<()>> {
+        self.files
+            .lock()
+            .unwrap()
+            .insert(path.to_path_buf(), bytes.to_vec());
+        Box::pin(async { Ok(()) })
+    }
+
+    fn cache_flush_temp<'a>(&'a mut self, _path: &'a Path) -> BoxFuture<'a, pklr::Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn cache_rename<'a>(&'a mut self, from: &'a Path, to: &'a Path) -> BoxFuture<'a, pklr::Result<()>> {
+        let bytes = self.files.lock().unwrap().remove(from);
+        let to = to.to_path_buf();
+        Box::pin(async move {
+            let bytes = bytes.ok_or_else(|| {
+                pklr::Error::Io(
+                    to.clone(),
+                    std::io::Error::from(std::io::ErrorKind::NotFound),
+                )
+            })?;
+            self.files.lock().unwrap().insert(to, bytes);
+            Ok(())
+        })
+    }
+
+    fn cache_dir_sync<'a>(&'a mut self, _path: &'a Path) -> BoxFuture<'a, pklr::Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn cache_list_dir<'a>(&'a mut self, path: &'a Path) -> BoxFuture<'a, pklr::Result<Vec<PathBuf>>> {
+        let mut entries: Vec<PathBuf> = self
+            .files
+            .lock()
+            .unwrap()
+            .keys()
+            .filter(|file| file.parent() == Some(path))
+            .cloned()
+            .collect();
+        entries.sort();
+        Box::pin(async move { Ok(entries) })
+    }
+
     fn read_env<'a>(&'a mut self, _name: &'a str) -> BoxFuture<'a, pklr::Result<Option<String>>> {
         Box::pin(async { Ok(None) })
     }
@@ -342,7 +390,7 @@ fn blocking_preload_uses_custom_capabilities() {
     assert!(
         files
             .values()
-            .any(|value| value == b"https://example.com/pkg@1.0.0.pkl")
+            .any(|value| String::from_utf8_lossy(value).contains("https://example.com/pkg@1.0.0.pkl"))
     );
 }
 

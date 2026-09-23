@@ -51,6 +51,97 @@ pub trait EvalCapabilities: Send + Sync {
         })
     }
 
+    /// Write `bytes` to a staging file inside the package cache.
+    ///
+    /// The file is created with `create_new`, fully written, and flushed to
+    /// disk by [`EvalCapabilities::cache_flush_temp`]. Callers publish it with
+    /// [`EvalCapabilities::cache_rename`]. Staging files always end in
+    /// [`crate::cache::STAGING_SUFFIX`] so a later run can reclaim them.
+    fn cache_write_temp<'a>(
+        &'a mut self,
+        path: &'a Path,
+        bytes: &'a [u8],
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+                .map_err(|error| crate::Error::Io(path.to_path_buf(), error))?;
+            if let Err(error) = file.write_all(bytes) {
+                drop(file);
+                let _ = std::fs::remove_file(path);
+                return Err(crate::Error::Io(path.to_path_buf(), error));
+            }
+            Ok(())
+        })
+    }
+
+    /// Flush a staged cache file to durable storage.
+    ///
+    /// A failure leaves the staging file behind; the next cache access
+    /// reclaims it (see [`crate::cache::sweep_staging`]).
+    fn cache_flush_temp<'a>(&'a mut self, path: &'a Path) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(path)
+                .and_then(|file| file.sync_all())
+                .map_err(|error| crate::Error::Io(path.to_path_buf(), error))
+        })
+    }
+
+    /// Atomically publish a staged cache file at its final location.
+    fn cache_rename<'a>(&'a mut self, from: &'a Path, to: &'a Path) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            let result = match std::fs::rename(from, to) {
+                Ok(()) => Ok(()),
+                // Windows rename does not replace an existing file.
+                Err(_) if to.exists() => {
+                    std::fs::remove_file(to).and_then(|()| std::fs::rename(from, to))
+                }
+                Err(error) => Err(error),
+            };
+            if result.is_err() {
+                let _ = std::fs::remove_file(from);
+            }
+            result.map_err(|error| crate::Error::Io(to.to_path_buf(), error))
+        })
+    }
+
+    /// Durably sync a cache directory after a publish.
+    fn cache_dir_sync<'a>(&'a mut self, path: &'a Path) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            #[cfg(unix)]
+            {
+                std::fs::File::open(path)
+                    .and_then(|dir| dir.sync_all())
+                    .map_err(|error| crate::Error::Io(path.to_path_buf(), error))
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = path;
+                Ok(())
+            }
+        })
+    }
+
+    /// List the entries of a cache directory (used to reclaim staging files).
+    fn cache_list_dir<'a>(&'a mut self, path: &'a Path) -> BoxFuture<'a, Result<Vec<PathBuf>>> {
+        Box::pin(async move {
+            let mut entries = Vec::new();
+            let read_dir = std::fs::read_dir(path)
+                .map_err(|error| crate::Error::Io(path.to_path_buf(), error))?;
+            for entry in read_dir {
+                let entry = entry.map_err(|error| crate::Error::Io(path.to_path_buf(), error))?;
+                entries.push(entry.path());
+            }
+            entries.sort();
+            Ok(entries)
+        })
+    }
+
     #[cfg(feature = "package-zip-core")]
     fn extract_zip<'a>(
         &'a mut self,
