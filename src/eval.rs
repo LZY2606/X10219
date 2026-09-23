@@ -36,6 +36,8 @@ pub struct Evaluator {
     package_dirs: HashMap<String, PathBuf>,
     /// Directory used to persist downloaded package content across evaluators.
     package_cache_dir: Option<PathBuf>,
+    /// Whether stale package staging files have been recovered for this cache.
+    package_cache_ready: bool,
     /// HTTP URL roots whose sources belong to direct-download packages.
     package_http_roots: HashSet<String>,
     /// Whether network access is disabled for this evaluator.
@@ -90,6 +92,7 @@ impl Default for Evaluator {
             #[cfg(feature = "package-zip-core")]
             package_dirs: HashMap::new(),
             package_cache_dir: None,
+            package_cache_ready: false,
             package_http_roots: HashSet::new(),
             offline: false,
             http_rewrites: Vec::new(),
@@ -125,6 +128,7 @@ impl Evaluator {
             #[cfg(feature = "package-zip-core")]
             package_dirs: HashMap::new(),
             package_cache_dir: None,
+            package_cache_ready: false,
             package_http_roots: HashSet::new(),
             offline: false,
             http_rewrites: Vec::new(),
@@ -168,6 +172,27 @@ impl Evaluator {
     /// Persist downloaded package content under `path`.
     pub fn set_package_cache_dir(&mut self, path: impl Into<PathBuf>) {
         self.package_cache_dir = Some(path.into());
+        self.package_cache_ready = false;
+    }
+
+    async fn ensure_package_cache_ready(&mut self) -> Result<()> {
+        if self.package_cache_ready {
+            return Ok(());
+        }
+        if let Some(cache_dir) = self.package_cache_dir.clone() {
+            let package_root = cache_dir.join("packages");
+            self.cleanup_package_staging(&package_root).await?;
+        }
+        self.package_cache_ready = true;
+        Ok(())
+    }
+
+    async fn cleanup_package_staging(&mut self, package_root: &Path) -> Result<()> {
+        let staging_paths = self.capabilities.recover_package_staging(package_root).await?;
+        for staging_path in staging_paths {
+            let _ = self.capabilities.remove_file(&staging_path).await;
+        }
+        Ok(())
     }
 
     /// Disable network access. Package imports can still use the persistent cache.
@@ -420,6 +445,7 @@ impl Evaluator {
     }
 
     async fn fetch_package_bytes(&mut self, url: &str, extension: &str) -> Result<Vec<u8>> {
+        self.ensure_package_cache_ready().await?;
         match self.read_package_cache(url, extension).await {
             Ok(Some(bytes)) => match validate_package_bytes(url, extension, &bytes) {
                 Ok(()) => return Ok(bytes),
@@ -455,7 +481,46 @@ impl Evaluator {
         let Some(cache_dir) = &self.package_cache_dir else {
             return Ok(None);
         };
-        let (data_path, url_path) = package_cache_paths(cache_dir, url, extension);
+        let metadata_path = package_metadata_path(cache_dir, url, extension);
+        let metadata = match self.capabilities.read_to_string(&metadata_path).await {
+            Ok(metadata) => metadata,
+            Err(Error::Io(_, error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                return self.read_legacy_package_cache(cache_dir, url, extension).await;
+            }
+            Err(error) => return Err(error),
+        };
+        let record = PackageMetadataRecord::parse(cache_dir, &metadata_path, url, &metadata)?;
+        if record.extension != extension {
+            return Err(Error::Eval(format!(
+                "package cache metadata has the wrong extension for {url}"
+            )));
+        }
+        let bytes = self.capabilities.read_bytes(&record.blob_path).await.map_err(|error| {
+            if matches!(error, Error::Io(_, ref io_error)
+                if io_error.kind() == std::io::ErrorKind::NotFound)
+            {
+                Error::Eval(format!(
+                    "package cache metadata exists but blob is missing for {url}"
+                ))
+            } else {
+                error
+            }
+        })?;
+        if record.digest != package_digest(&bytes) {
+            return Err(Error::Eval(format!(
+                "package cache digest mismatch for {url}"
+            )));
+        }
+        Ok(Some(bytes))
+    }
+
+    async fn read_legacy_package_cache(
+        &mut self,
+        cache_dir: &Path,
+        url: &str,
+        extension: &str,
+    ) -> Result<Option<Vec<u8>>> {
+        let (data_path, url_path) = package_legacy_paths(cache_dir, url, extension);
         let cached_url = match self.capabilities.read_to_string(&url_path).await {
             Ok(cached_url) => cached_url,
             Err(Error::Io(_, error)) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -483,15 +548,47 @@ impl Evaluator {
         let Some(cache_dir) = &self.package_cache_dir else {
             return Ok(());
         };
-        let (data_path, url_path) = package_cache_paths(cache_dir, url, extension);
-        let Some(parent) = data_path.parent() else {
-            return Ok(());
-        };
+        self.ensure_package_cache_ready().await?;
+        let metadata_path = package_metadata_path(cache_dir, url, extension);
+        let blob_path = package_blob_path(cache_dir, url, extension, bytes);
+        let parent = metadata_path
+            .parent()
+            .ok_or_else(|| Error::Eval("package cache path has no parent directory".into()))?;
         self.capabilities.create_dir_all(parent).await?;
-        self.capabilities.write_atomic(&data_path, bytes).await?;
-        self.capabilities
-            .write_atomic(&url_path, url.as_bytes())
+        self.write_cache_artifact(&blob_path, bytes, CacheArtifact::Blob).await?;
+        let metadata = PackageMetadataRecord::new(url, extension, bytes).to_json()?;
+        self.write_cache_artifact(&metadata_path, metadata.as_bytes(), CacheArtifact::Metadata)
+            .await?;
+        Ok(())
+    }
+
+    async fn write_cache_artifact(
+        &mut self,
+        destination: &Path,
+        bytes: &[u8],
+        artifact: CacheArtifact,
+    ) -> Result<()> {
+        let staging_path = self.capabilities.package_staging_path(destination).await?;
+        let creation = self
+            .capabilities
+            .create_package_staging(&staging_path, bytes)
+            .await;
+        if let Err(error) = creation {
+            let _ = self.capabilities.remove_package_staging(&staging_path).await;
+            return Err(error);
+        }
+        if let Err(error) = self
+            .capabilities
+            .publish_package_staging(&staging_path, destination)
             .await
+        {
+            let _ = self.capabilities.remove_package_staging(&staging_path).await;
+            return Err(error);
+        }
+        if artifact == CacheArtifact::Metadata {
+            self.capabilities.sync_parent_directory(destination).await?;
+        }
+        Ok(())
     }
 
     /// Seed the persistent package cache with `bytes` for `url`.
@@ -506,9 +603,10 @@ impl Evaluator {
         extension: &str,
         bytes: &[u8],
     ) -> Result<()> {
-        if self.package_cache_dir.is_none() {
+        let Some(cache_dir) = self.package_cache_dir.clone() else {
             return Ok(());
-        }
+        };
+        self.ensure_package_cache_ready().await?;
         if let Ok(Some(cached)) = self.read_package_cache(url, extension).await
             && validate_package_bytes(url, extension, &cached).is_ok()
         {
@@ -527,9 +625,23 @@ impl Evaluator {
         let Some(cache_dir) = &self.package_cache_dir else {
             return;
         };
-        let (data_path, url_path) = package_cache_paths(cache_dir, url, extension);
-        let _ = self.capabilities.remove_file(&data_path).await;
-        let _ = self.capabilities.remove_file(&url_path).await;
+        if let Ok(metadata) =
+            self.capabilities
+                .read_to_string(&package_metadata_path(cache_dir, url, extension))
+            .await
+            && let Ok(record) =
+                PackageMetadataRecord::parse(cache_dir, &package_metadata_path(cache_dir, url, extension), url, &metadata)
+        {
+            let _ = self.capabilities.remove_file(&record.blob_path).await;
+        } else {
+            let (data_path, url_path) = package_legacy_paths(cache_dir, url, extension);
+            let _ = self.capabilities.remove_file(&data_path).await;
+            let _ = self.capabilities.remove_file(&url_path).await;
+        }
+        let _ = self
+            .capabilities
+            .remove_file(&package_metadata_path(cache_dir, url, extension))
+            .await;
     }
 
     /// Download a package zip and extract it to a temp directory.

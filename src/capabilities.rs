@@ -45,6 +45,65 @@ pub trait EvalCapabilities: Send + Sync {
         })
     }
 
+    fn package_staging_path<'a>(
+        &'a mut self,
+        destination: &'a Path,
+    ) -> BoxFuture<'a, Result<PathBuf>> {
+        Box::pin(async move {
+            crate::eval::package_staging_path(destination)
+                .map_err(|error| crate::Error::Io(destination.to_path_buf(), error))
+        })
+    }
+
+    fn create_package_staging<'a>(
+        &'a mut self,
+        staging_path: &'a Path,
+        bytes: &'a [u8],
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            crate::eval::create_package_staging(staging_path, bytes)
+                .map_err(|error| crate::Error::Io(staging_path.to_path_buf(), error))
+        })
+    }
+
+    fn publish_package_staging<'a>(
+        &'a mut self,
+        staging_path: &'a Path,
+        destination: &'a Path,
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            crate::eval::publish_package_staging(staging_path, destination)
+                .map_err(|error| crate::Error::Io(destination.to_path_buf(), error))
+        })
+    }
+
+    fn sync_parent_directory<'a>(&'a mut self, path: &'a Path) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            crate::eval::sync_parent_directory(path)
+                .map_err(|error| crate::Error::Io(path.to_path_buf(), error))
+        })
+    }
+
+    fn remove_package_staging<'a>(
+        &'a mut self,
+        staging_path: &'a Path,
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            crate::eval::remove_package_staging(staging_path)
+                .map_err(|error| crate::Error::Io(staging_path.to_path_buf(), error))
+        })
+    }
+
+    fn recover_package_staging<'a>(
+        &'a mut self,
+        package_root: &'a Path,
+    ) -> BoxFuture<'a, Result<Vec<PathBuf>>> {
+        Box::pin(async move {
+            crate::eval::recover_package_staging(package_root)
+                .map_err(|error| crate::Error::Io(package_root.to_path_buf(), error))
+        })
+    }
+
     fn remove_file<'a>(&'a mut self, path: &'a Path) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
             std::fs::remove_file(path).map_err(|error| crate::Error::Io(path.to_path_buf(), error))
