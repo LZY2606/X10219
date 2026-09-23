@@ -36,6 +36,8 @@ pub struct Evaluator {
     package_dirs: HashMap<String, PathBuf>,
     /// Directory used to persist downloaded package content across evaluators.
     package_cache_dir: Option<PathBuf>,
+    /// Whether stale cache temp files were already cleaned for this evaluator.
+    cache_temps_cleaned: bool,
     /// HTTP URL roots whose sources belong to direct-download packages.
     package_http_roots: HashSet<String>,
     /// Whether network access is disabled for this evaluator.
@@ -90,6 +92,7 @@ impl Default for Evaluator {
             #[cfg(feature = "package-zip-core")]
             package_dirs: HashMap::new(),
             package_cache_dir: None,
+            cache_temps_cleaned: false,
             package_http_roots: HashSet::new(),
             offline: false,
             http_rewrites: Vec::new(),
@@ -125,6 +128,7 @@ impl Evaluator {
             #[cfg(feature = "package-zip-core")]
             package_dirs: HashMap::new(),
             package_cache_dir: None,
+            cache_temps_cleaned: false,
             package_http_roots: HashSet::new(),
             offline: false,
             http_rewrites: Vec::new(),
@@ -429,8 +433,11 @@ impl Evaluator {
             Ok(None) => {}
             Err(error) if self.offline => return Err(error),
             Err(_) => {
-                // The persistent cache is an optimization while online. If it
-                // is unreadable, fetch from the network and continue without it.
+                // The persistent cache is an optimization while online. A
+                // rejected entry (corrupt metadata, checksum mismatch,
+                // unsupported version, escaping path) is removed so the
+                // refetch can replace it.
+                self.remove_package_cache(url, extension).await;
             }
         }
         if self.offline {
@@ -451,26 +458,69 @@ impl Evaluator {
         Ok(bytes)
     }
 
+    /// Remove stale atomic-write temp files from the package cache.
+    ///
+    /// Runs at most once per evaluator, on the first cache access, so temp
+    /// files left behind by an interrupted previous run are recognized and
+    /// cleaned up on the next startup.
+    async fn clean_stale_cache_temps(&mut self) {
+        if self.cache_temps_cleaned {
+            return;
+        }
+        self.cache_temps_cleaned = true;
+        let Some(cache_dir) = self.package_cache_dir.clone() else {
+            return;
+        };
+        let packages_dir = cache_dir.join("packages");
+        let Ok(stale) = self
+            .capabilities
+            .glob(&packages_dir, CACHE_TEMP_GLOB_PATTERN)
+            .await
+        else {
+            return;
+        };
+        for entry in stale {
+            let _ = self.capabilities.remove_file(&entry).await;
+        }
+    }
+
     async fn read_package_cache(&mut self, url: &str, extension: &str) -> Result<Option<Vec<u8>>> {
+        self.clean_stale_cache_temps().await;
         let Some(cache_dir) = &self.package_cache_dir else {
             return Ok(None);
         };
-        let (data_path, url_path) = package_cache_paths(cache_dir, url, extension);
-        let cached_url = match self.capabilities.read_to_string(&url_path).await {
-            Ok(cached_url) => cached_url,
+        let (_data_path, meta_path) = package_cache_paths(cache_dir, url, extension);
+        let meta_source = match self.capabilities.read_to_string(&meta_path).await {
+            Ok(meta_source) => meta_source,
             Err(Error::Io(_, error)) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(None);
             }
             Err(error) => return Err(error),
         };
-        if cached_url != url {
+        let metadata = CacheMetadata::from_json(url, &meta_source)?;
+        if metadata.url != url || metadata.extension != extension {
+            // Hash collision or an entry written for a different extension:
+            // treat as a miss, never as a hit.
             return Ok(None);
         }
-        match self.capabilities.read_bytes(&data_path).await {
-            Ok(bytes) => Ok(Some(bytes)),
-            Err(Error::Io(_, error)) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(error),
+        let blob_path = metadata.blob_path(&cache_dir.join("packages"))?;
+        let bytes = match self.capabilities.read_bytes(&blob_path).await {
+            Ok(bytes) => Some(bytes),
+            Err(Error::Io(_, error)) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
+        let Some(bytes) = bytes else {
+            // Metadata without its blob is a half-written entry: a miss.
+            return Ok(None);
+        };
+        let digest = package_digest(&bytes);
+        if digest != metadata.sha256 {
+            return Err(Error::Eval(format!(
+                "package cache checksum mismatch for {url}: expected {}, got {digest}",
+                metadata.sha256
+            )));
         }
+        Ok(Some(bytes))
     }
 
     /// Cache `bytes` for `url`. The fetch path ignores the error; preloading does not.
@@ -480,17 +530,23 @@ impl Evaluator {
         extension: &str,
         bytes: &[u8],
     ) -> Result<()> {
-        let Some(cache_dir) = &self.package_cache_dir else {
+        let Some(cache_dir) = self.package_cache_dir.clone() else {
             return Ok(());
         };
-        let (data_path, url_path) = package_cache_paths(cache_dir, url, extension);
+        self.clean_stale_cache_temps().await;
+        let (data_path, meta_path) = package_cache_paths(&cache_dir, url, extension);
         let Some(parent) = data_path.parent() else {
             return Ok(());
         };
+        let blob_name = data_path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let metadata = CacheMetadata::new(url, extension, &blob_name, &package_digest(bytes));
         self.capabilities.create_dir_all(parent).await?;
         self.capabilities.write_atomic(&data_path, bytes).await?;
         self.capabilities
-            .write_atomic(&url_path, url.as_bytes())
+            .write_atomic(&meta_path, metadata.to_json().as_bytes())
             .await
     }
 
@@ -5619,12 +5675,114 @@ fn package_cache_paths(cache_dir: &Path, url: &str, extension: &str) -> (PathBuf
     // the cache layout depend on platform path rules. The adjacent URL file
     // detects the extraordinarily unlikely hash collision.
     let mut hash = 0xcbf29ce484222325_u64;
+    for byte in extension.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash ^= 0xff;
+    hash = hash.wrapping_mul(0x100000001b3);
     for byte in url.as_bytes() {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(0x100000001b3);
     }
     let base = cache_dir.join("packages").join(format!("{hash:016x}"));
-    (base.with_extension(extension), base.with_extension("url"))
+    (base.with_extension(extension), base.with_extension("meta"))
+}
+
+/// Version of the on-disk package cache metadata format. Caches written by
+/// other versions are rejected instead of being interpreted optimistically.
+pub(crate) const CACHE_METADATA_VERSION: u32 = 1;
+
+/// Parsed contents of a package cache `.meta` sidecar file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CacheMetadata {
+    url: String,
+    extension: String,
+    blob: String,
+    sha256: String,
+}
+
+impl CacheMetadata {
+    fn new(url: &str, extension: &str, blob: &str, sha256: &str) -> Self {
+        Self {
+            url: url.to_string(),
+            extension: extension.to_string(),
+            blob: blob.to_string(),
+            sha256: sha256.to_string(),
+        }
+    }
+
+    fn to_json(&self) -> String {
+        serde_json::json!({
+            "version": CACHE_METADATA_VERSION,
+            "url": self.url,
+            "extension": self.extension,
+            "blob": self.blob,
+            "sha256": self.sha256,
+        })
+        .to_string()
+    }
+
+    fn from_json(url: &str, source: &str) -> Result<Self> {
+        let corrupt = |detail: String| {
+            Error::Eval(format!(
+                "corrupt package cache metadata for {url}: {detail}"
+            ))
+        };
+        let value: serde_json::Value =
+            serde_json::from_str(source).map_err(|error| corrupt(error.to_string()))?;
+        let object = value
+            .as_object()
+            .ok_or_else(|| corrupt("expected a JSON object".to_string()))?;
+        let field = |name: &str| -> Result<&str> {
+            object
+                .get(name)
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| corrupt(format!("missing string field '{name}'")))
+        };
+        let version = object
+            .get("version")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| corrupt("missing integer field 'version'".to_string()))?;
+        if version != u64::from(CACHE_METADATA_VERSION) {
+            return Err(Error::Eval(format!(
+                "unsupported package cache version {version} for {url} (supported: {CACHE_METADATA_VERSION})"
+            )));
+        }
+        Ok(Self {
+            url: field("url")?.to_string(),
+            extension: field("extension")?.to_string(),
+            blob: field("blob")?.to_string(),
+            sha256: field("sha256")?.to_string(),
+        })
+    }
+
+    /// Resolve the blob path, rejecting entries that would escape the cache.
+    fn blob_path(&self, packages_dir: &Path) -> Result<PathBuf> {
+        let relative = Path::new(&self.blob);
+        let escapes = relative.is_absolute()
+            || relative.components().any(|component| {
+                !matches!(component, std::path::Component::Normal(_))
+            });
+        if escapes || self.blob.is_empty() {
+            return Err(Error::Eval(format!(
+                "package cache metadata for {} points outside the package cache: {}",
+                self.url, self.blob
+            )));
+        }
+        Ok(packages_dir.join(relative))
+    }
+}
+
+/// Hex-encoded SHA-256 digest of cached package bytes.
+pub(crate) fn package_digest(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(bytes);
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        hex.push_str(&format!("{byte:02x}"));
+    }
+    hex
 }
 
 fn validate_package_bytes(url: &str, extension: &str, bytes: &[u8]) -> Result<()> {
@@ -5651,8 +5809,87 @@ fn validate_package_bytes(url: &str, extension: &str, bytes: &[u8]) -> Result<()
     Ok(())
 }
 
-pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
+/// Glob pattern matching atomic-write temp files left in the package cache
+/// by an interrupted run. Kept in sync with the temp naming in
+/// [`write_atomic_with`]: `.{name}.tmp-{pid}-{counter}`.
+pub(crate) const CACHE_TEMP_GLOB_PATTERN: &str = ".*.tmp-*";
+
+/// Filesystem operations backing [`write_atomic_with`].
+///
+/// This is a restricted dependency-injection boundary extracted for tests:
+/// it lets contract tests inject failures at each atomic-write boundary
+/// (temp create, write, flush, rename, directory sync) without changing the
+/// public evaluation semantics. The production path uses
+/// [`NativeAtomicWriteOps`].
+#[doc(hidden)]
+pub trait AtomicWriteOps {
+    fn create_temp_file(&self, path: &Path) -> std::io::Result<std::fs::File>;
+    fn write_all(&self, file: &mut std::fs::File, bytes: &[u8]) -> std::io::Result<()>;
+    fn sync_file(&self, file: &mut std::fs::File) -> std::io::Result<()>;
+    fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()>;
+    fn remove_file(&self, path: &Path) -> std::io::Result<()>;
+    fn sync_dir(&self, dir: &Path) -> std::io::Result<()>;
+    fn exists(&self, path: &Path) -> bool;
+}
+
+/// Real-filesystem [`AtomicWriteOps`] used in production.
+#[doc(hidden)]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NativeAtomicWriteOps;
+
+impl AtomicWriteOps for NativeAtomicWriteOps {
+    fn create_temp_file(&self, path: &Path) -> std::io::Result<std::fs::File> {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+    }
+
+    fn write_all(&self, file: &mut std::fs::File, bytes: &[u8]) -> std::io::Result<()> {
+        use std::io::Write;
+        file.write_all(bytes)
+    }
+
+    fn sync_file(&self, file: &mut std::fs::File) -> std::io::Result<()> {
+        file.sync_all()
+    }
+
+    fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+        std::fs::rename(from, to)
+    }
+
+    fn remove_file(&self, path: &Path) -> std::io::Result<()> {
+        std::fs::remove_file(path)
+    }
+
+    fn sync_dir(&self, dir: &Path) -> std::io::Result<()> {
+        // Directory fsync after rename is only meaningful on Unix; elsewhere
+        // the rename itself is the durability boundary.
+        #[cfg(unix)]
+        {
+            std::fs::File::open(dir)?.sync_all()
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = dir;
+            Ok(())
+        }
+    }
+
+    fn exists(&self, path: &Path) -> bool {
+        path.exists()
+    }
+}
+
+/// Write `bytes` to `path` atomically via a temp file, fsync, and rename,
+/// followed by a best-effort directory sync. Injectable through
+/// [`AtomicWriteOps`] for fault-injection tests.
+#[doc(hidden)]
+pub fn write_atomic_with(
+    ops: &impl AtomicWriteOps,
+    path: &Path,
+    bytes: &[u8],
+) -> std::io::Result<()> {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -5665,30 +5902,36 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         std::process::id(),
         COUNTER.fetch_add(1, Ordering::Relaxed)
     ));
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temp_path)?;
-    let write_result = file.write_all(bytes).and_then(|()| file.sync_all());
+    let mut file = ops.create_temp_file(&temp_path)?;
+    let write_result =
+        ops.write_all(&mut file, bytes).and_then(|()| ops.sync_file(&mut file));
     drop(file);
     if let Err(error) = write_result {
-        let _ = std::fs::remove_file(&temp_path);
+        let _ = ops.remove_file(&temp_path);
         return Err(error);
     }
-    let rename_result = match std::fs::rename(&temp_path, path) {
-        Ok(()) => return Ok(()),
+    let rename_result = match ops.rename(&temp_path, path) {
+        Ok(()) => Ok(()),
         // Windows rename does not replace an existing file. There is a brief
         // non-atomic gap on that platform, but the destination must not retain
         // stale bytes while its URL sidecar is updated.
-        Err(_) if path.exists() => {
-            std::fs::remove_file(path).and_then(|()| std::fs::rename(&temp_path, path))
-        }
+        Err(_) if ops.exists(path) => ops
+            .remove_file(path)
+            .and_then(|()| ops.rename(&temp_path, path)),
         Err(error) => Err(error),
     };
     if rename_result.is_err() {
-        let _ = std::fs::remove_file(temp_path);
+        let _ = ops.remove_file(&temp_path);
     }
-    rename_result
+    rename_result?;
+    if let Some(parent) = path.parent() {
+        ops.sync_dir(parent)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    write_atomic_with(&NativeAtomicWriteOps, path, bytes)
 }
 
 /// Resolve a `package://` URI to a download source.
