@@ -51,6 +51,22 @@ pub trait EvalCapabilities: Send + Sync {
         })
     }
 
+    /// List the entries of a directory. Used to sweep stale temp files from
+    /// the package cache. The default implementation reads the real
+    /// filesystem; in-memory capabilities should override it.
+    fn list_dir<'a>(&'a mut self, path: &'a Path) -> BoxFuture<'a, Result<Vec<PathBuf>>> {
+        Box::pin(async move {
+            let entries = std::fs::read_dir(path)
+                .map_err(|error| crate::Error::Io(path.to_path_buf(), error))?;
+            let mut out = Vec::new();
+            for entry in entries {
+                let entry = entry.map_err(|error| crate::Error::Io(path.to_path_buf(), error))?;
+                out.push(entry.path());
+            }
+            Ok(out)
+        })
+    }
+
     #[cfg(feature = "package-zip-core")]
     fn extract_zip<'a>(
         &'a mut self,

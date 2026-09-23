@@ -43,6 +43,8 @@ pub struct Evaluator {
     /// HTTP URL rewrite rules (source_prefix → target_prefix).
     /// Longest matching prefix wins.
     http_rewrites: Vec<(String, String)>,
+    /// Whether stale temp files in the package cache were swept this session.
+    cache_temp_swept: bool,
     /// Converters extracted from `output.renderer.converters`.
     /// Each entry maps a class name to a converter lambda.
     converters: Vec<(String, Value)>,
@@ -93,6 +95,7 @@ impl Default for Evaluator {
             package_http_roots: HashSet::new(),
             offline: false,
             http_rewrites: Vec::new(),
+            cache_temp_swept: false,
             converters: Vec::new(),
             warned_deprecated: std::collections::HashSet::new(),
         }
@@ -128,6 +131,7 @@ impl Evaluator {
             package_http_roots: HashSet::new(),
             offline: false,
             http_rewrites: Vec::new(),
+            cache_temp_swept: false,
             converters: Vec::new(),
             warned_deprecated: std::collections::HashSet::new(),
         }
