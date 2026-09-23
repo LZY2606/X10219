@@ -61,6 +61,65 @@ impl EvalCapabilities for MemoryCacheCapabilities {
         Box::pin(async { Ok(()) })
     }
 
+    fn cache_mkdir<'a>(&'a mut self, _path: &'a Path) -> BoxFuture<'a, pklr::Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn cache_create_file<'a>(
+        &'a mut self,
+        _kind: pklr::package_cache::FileKind,
+        path: &'a Path,
+        bytes: &'a [u8],
+    ) -> BoxFuture<'a, pklr::Result<()>> {
+        self.files
+            .lock()
+            .unwrap()
+            .insert(path.to_path_buf(), bytes.to_vec());
+        Box::pin(async { Ok(()) })
+    }
+
+    fn cache_rename<'a>(
+        &'a mut self,
+        _kind: pklr::package_cache::FileKind,
+        from: &'a Path,
+        to: &'a Path,
+    ) -> BoxFuture<'a, pklr::Result<()>> {
+        let mut files = self.files.lock().unwrap();
+        if let Some(bytes) = files.remove(from) {
+            files.insert(to.to_path_buf(), bytes);
+        }
+        Box::pin(async { Ok(()) })
+    }
+
+    fn cache_flush_file<'a>(
+        &'a mut self,
+        _kind: pklr::package_cache::FileKind,
+        _path: &'a Path,
+    ) -> BoxFuture<'a, pklr::Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn cache_sync_dir<'a>(
+        &'a mut self,
+        _kind: pklr::package_cache::FileKind,
+        _path: &'a Path,
+    ) -> BoxFuture<'a, pklr::Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn list_dir<'a>(&'a mut self, path: &'a Path) -> BoxFuture<'a, pklr::Result<Vec<PathBuf>>> {
+        let prefix = path.to_path_buf();
+        let paths = self
+            .files
+            .lock()
+            .unwrap()
+            .keys()
+            .filter(|candidate| candidate.parent() == Some(&prefix))
+            .cloned()
+            .collect();
+        Box::pin(async move { Ok(paths) })
+    }
+
     fn read_env<'a>(&'a mut self, _name: &'a str) -> BoxFuture<'a, pklr::Result<Option<String>>> {
         Box::pin(async { Ok(None) })
     }
@@ -339,11 +398,17 @@ fn blocking_preload_uses_custom_capabilities() {
     let files = files.lock().unwrap();
     assert_eq!(files.len(), 2);
     assert!(files.values().any(|value| value == b"answer = 42\n"));
-    assert!(
-        files
-            .values()
-            .any(|value| value == b"https://example.com/pkg@1.0.0.pkl")
-    );
+    let metadata = files
+        .values()
+        .find(|value| {
+            std::str::from_utf8(value)
+                .is_ok_and(|text| text.contains("https://example.com/pkg@1.0.0.pkl"))
+        })
+        .expect("metadata file present");
+    let metadata_text = std::str::from_utf8(metadata).unwrap();
+    assert!(metadata_text.contains("https://example.com/pkg@1.0.0.pkl"));
+    assert!(metadata_text.contains("\"version\":1"));
+    assert!(metadata_text.contains("\"sha256\""));
 }
 
 #[test]

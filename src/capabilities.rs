@@ -81,6 +81,115 @@ pub trait EvalCapabilities: Send + Sync {
         base: &'a Path,
         pattern: &'a str,
     ) -> BoxFuture<'a, Result<Vec<PathBuf>>>;
+
+    // --- Persistent package cache boundaries ---------------------------------
+    //
+    // Each commit boundary is a separate call so embedders and tests can fail
+    // write, flush, rename, and sync independently. Default implementations use
+    // the local filesystem and are overridden by the in-memory test host.
+
+    /// Create the parent directory of a staged cache file.
+    fn cache_mkdir<'a>(&'a mut self, path: &'a Path) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            std::fs::create_dir_all(path)
+                .map_err(|error| crate::Error::Io(path.to_path_buf(), error))
+        })
+    }
+
+    /// Create a new staged cache file (must not already exist).
+    fn cache_create_file<'a>(
+        &'a mut self,
+        _kind: crate::package_cache::FileKind,
+        path: &'a Path,
+        bytes: &'a [u8],
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+                .map_err(|error| crate::Error::Io(path.to_path_buf(), error))?;
+            file.write_all(bytes)
+                .map_err(|error| crate::Error::Io(path.to_path_buf(), error))
+        })
+    }
+
+    /// Flush a staged file's contents to stable storage.
+    fn cache_flush_file<'a>(
+        &'a mut self,
+        _kind: crate::package_cache::FileKind,
+        path: &'a Path,
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(path)
+                .map_err(|error| crate::Error::Io(path.to_path_buf(), error))?;
+            file.sync_all()
+                .map_err(|error| crate::Error::Io(path.to_path_buf(), error))
+        })
+    }
+
+    /// Atomically publish a staged file at its final name.
+    fn cache_rename<'a>(
+        &'a mut self,
+        _kind: crate::package_cache::FileKind,
+        from: &'a Path,
+        to: &'a Path,
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            match std::fs::rename(from, to) {
+                Ok(()) => Ok(()),
+                // Windows rename cannot replace; mirror write_atomic's fallback.
+                Err(_) if to.exists() => {
+                    std::fs::remove_file(to)
+                        .and_then(|()| std::fs::rename(from, to))
+                        .map_err(|error| crate::Error::Io(from.to_path_buf(), error))
+                }
+                Err(error) => Err(crate::Error::Io(from.to_path_buf(), error)),
+            }
+        })
+    }
+
+    /// Sync a directory entry after a rename so the publish is durable.
+    fn cache_sync_dir<'a>(
+        &'a mut self,
+        _kind: crate::package_cache::FileKind,
+        path: &'a Path,
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            match std::fs::File::open(path) {
+                Ok(file) => file
+                    .sync_all()
+                    .map_err(|error| crate::Error::Io(path.to_path_buf(), error)),
+                // Directory fsync is not available on every platform; the
+                // rename already happened.
+                Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => Ok(()),
+                Err(error) => Err(crate::Error::Io(path.to_path_buf(), error)),
+            }
+        })
+    }
+
+    /// List the direct children of a cache directory. Missing directories
+    /// yield an empty result rather than an error.
+    fn list_dir<'a>(&'a mut self, path: &'a Path) -> BoxFuture<'a, Result<Vec<PathBuf>>> {
+        Box::pin(async move {
+            match std::fs::read_dir(path) {
+                Ok(entries) => {
+                    let mut paths = Vec::new();
+                    for entry in entries {
+                        let entry =
+                            entry.map_err(|error| crate::Error::Io(path.to_path_buf(), error))?;
+                        paths.push(entry.path());
+                    }
+                    Ok(paths)
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+                Err(error) => Err(crate::Error::Io(path.to_path_buf(), error)),
+            }
+        })
+    }
 }
 
 #[cfg(feature = "native-io")]

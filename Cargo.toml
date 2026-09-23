@@ -41,6 +41,7 @@ zip             = { version = "8", default-features = false, features = ["deflat
 url             = { version = "2", optional = true }
 
 [dev-dependencies]
+pollster = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 
 [[test]]
@@ -54,6 +55,14 @@ required-features = ["async", "package-zip"]
 [[test]]
 name = "blocking"
 required-features = ["blocking"]
+
+[[test]]
+name = "model_contract"
+required-features = ["eval-core", "native-io", "blocking"]
+
+[[test]]
+name = "cache_faults"
+required-features = ["eval-core", "native-io", "blocking"]
 
 [profile.dev]
 debug = 1
