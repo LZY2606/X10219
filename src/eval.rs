@@ -5616,15 +5616,88 @@ enum PackageSource {
 
 fn package_cache_paths(cache_dir: &Path, url: &str, extension: &str) -> (PathBuf, PathBuf) {
     // FNV-1a gives package URLs stable, filesystem-safe names without making
-    // the cache layout depend on platform path rules. The adjacent URL file
-    // detects the extraordinarily unlikely hash collision.
+    // the cache layout depend on platform path rules. The adjacent metadata
+    // file records the URL (detecting the extraordinarily unlikely hash
+    // collision), the blob name, and a checksum of the blob bytes.
+    let base = cache_dir.join("packages").join(format!("{hash:016x}"));
+    (base.with_extension(extension), base.with_extension("meta"))
+}
+
+fn fnv1a(bytes: &[u8]) -> u64 {
     let mut hash = 0xcbf29ce484222325_u64;
-    for byte in url.as_bytes() {
+    for byte in bytes {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(0x100000001b3);
     }
-    let base = cache_dir.join("packages").join(format!("{hash:016x}"));
-    (base.with_extension(extension), base.with_extension("url"))
+    hash
+}
+
+/// Cache metadata sidecar format version. Bump when the layout changes;
+/// entries written by other versions are rejected instead of trusted.
+const PACKAGE_CACHE_META_VERSION: u32 = 1;
+const PACKAGE_CACHE_META_MAGIC: &str = "pklr-cache-meta";
+
+fn encode_package_cache_meta(url: &str, blob_name: &str, bytes: &[u8]) -> String {
+    format!(
+        "{PACKAGE_CACHE_META_MAGIC} {PACKAGE_CACHE_META_VERSION}\n{url}\n{blob_name}\n{:016x}\n",
+        fnv1a(bytes)
+    )
+}
+
+/// Validate a cache metadata sidecar for `url`. Returns `Ok(None)` when the
+/// entry belongs to a different URL (hash collision → treat as a miss), and
+/// `Ok(Some(checksum))` when the entry matches. Corrupt metadata, unsupported
+/// versions, and blob paths that would escape the cache directory are
+/// rejected with distinct errors.
+fn check_package_cache_meta(
+    meta: &str,
+    url: &str,
+    data_path: &Path,
+    meta_path: &Path,
+) -> Result<Option<u64>> {
+    let corrupt = || {
+        Error::Eval(format!(
+            "corrupt package cache metadata: {}",
+            meta_path.display()
+        ))
+    };
+    let lines: Vec<&str> = meta.lines().collect();
+    let header = lines.first().copied().unwrap_or("");
+    let expected_header = format!("{PACKAGE_CACHE_META_MAGIC} {PACKAGE_CACHE_META_VERSION}");
+    if header != expected_header {
+        return Err(if header.starts_with(PACKAGE_CACHE_META_MAGIC) {
+            Error::Eval(format!(
+                "unsupported package cache metadata version: {}",
+                meta_path.display()
+            ))
+        } else {
+            corrupt()
+        });
+    }
+    if lines.len() != 4 {
+        return Err(corrupt());
+    }
+    let cached_url = lines[1];
+    let blob_name = lines[2];
+    let checksum = u64::from_str_radix(lines[3], 16).map_err(|_| corrupt())?;
+    // The recorded blob must be a plain file name; anything else could point
+    // outside the cache directory and must not be trusted.
+    let mut components = Path::new(blob_name).components();
+    let is_plain_name = matches!(components.next(), Some(std::path::Component::Normal(_)))
+        && components.next().is_none();
+    if !is_plain_name {
+        return Err(Error::Eval(format!(
+            "package cache blob path escapes cache dir: {}",
+            meta_path.display()
+        )));
+    }
+    if cached_url != url {
+        return Ok(None);
+    }
+    if data_path.file_name().and_then(|name| name.to_str()) != Some(blob_name) {
+        return Err(corrupt());
+    }
+    Ok(Some(checksum))
 }
 
 fn validate_package_bytes(url: &str, extension: &str, bytes: &[u8]) -> Result<()> {
