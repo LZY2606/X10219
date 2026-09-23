@@ -41,6 +41,12 @@ pub struct EvalOutcome {
     /// Missing variables are included with a `None` value. Entries are ordered
     /// by variable name so callers can serialize or hash them deterministically.
     pub env_reads: std::collections::BTreeMap<String, Option<String>>,
+    /// System properties read during evaluation (name → observed value).
+    ///
+    /// The pure-Rust host does not resolve `prop:` values, so every observed
+    /// key maps to `None`; the key set still records the dependency. Entries
+    /// are ordered by property name.
+    pub prop_reads: std::collections::BTreeMap<String, Option<String>>,
 }
 
 /// Evaluate a Pkl file synchronously and return its contents as JSON.
@@ -329,6 +335,7 @@ async fn eval_with_evaluator(path: &Path, mut evaluator: Evaluator) -> Result<Ev
     Ok(EvalOutcome {
         json: value.to_json(),
         env_reads: evaluator.take_env_reads(),
+        prop_reads: evaluator.take_prop_reads(),
     })
 }
 

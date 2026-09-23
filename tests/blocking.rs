@@ -339,11 +339,13 @@ fn blocking_preload_uses_custom_capabilities() {
     let files = files.lock().unwrap();
     assert_eq!(files.len(), 2);
     assert!(files.values().any(|value| value == b"answer = 42\n"));
-    assert!(
-        files
-            .values()
-            .any(|value| value == b"https://example.com/pkg@1.0.0.pkl")
-    );
+    let metadata = files
+        .values()
+        .find(|value| value.starts_with(b"{"))
+        .expect("a JSON metadata file should be written");
+    let metadata: serde_json::Value = serde_json::from_slice(metadata).unwrap();
+    assert_eq!(metadata["url"], "https://example.com/pkg@1.0.0.pkl");
+    assert_eq!(metadata["version"], 1);
 }
 
 #[test]

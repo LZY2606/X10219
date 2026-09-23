@@ -51,6 +51,25 @@ pub trait EvalCapabilities: Send + Sync {
         })
     }
 
+    /// List a directory's entries in sorted order so embedders observe a
+    /// deterministic sequence regardless of host filesystem ordering.
+    fn read_dir<'a>(&'a mut self, path: &'a Path) -> BoxFuture<'a, Result<Vec<PathBuf>>> {
+        Box::pin(async move {
+            let mut entries = Vec::new();
+            let read_dir = std::fs::read_dir(path)
+                .map_err(|error| crate::Error::Io(path.to_path_buf(), error))?;
+            for entry in read_dir {
+                entries.push(
+                    entry
+                        .map_err(|error| crate::Error::Io(path.to_path_buf(), error))?
+                        .path(),
+                );
+            }
+            entries.sort();
+            Ok(entries)
+        })
+    }
+
     #[cfg(feature = "package-zip-core")]
     fn extract_zip<'a>(
         &'a mut self,
