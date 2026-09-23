@@ -40,6 +40,8 @@ pub struct Evaluator {
     package_http_roots: HashSet<String>,
     /// Whether network access is disabled for this evaluator.
     offline: bool,
+    /// Whether interrupted cache staging files have been reclaimed.
+    cache_staging_swept: bool,
     /// HTTP URL rewrite rules (source_prefix → target_prefix).
     /// Longest matching prefix wins.
     http_rewrites: Vec<(String, String)>,
@@ -92,6 +94,7 @@ impl Default for Evaluator {
             package_cache_dir: None,
             package_http_roots: HashSet::new(),
             offline: false,
+            cache_staging_swept: false,
             http_rewrites: Vec::new(),
             converters: Vec::new(),
             warned_deprecated: std::collections::HashSet::new(),
@@ -127,6 +130,7 @@ impl Evaluator {
             package_cache_dir: None,
             package_http_roots: HashSet::new(),
             offline: false,
+            cache_staging_swept: false,
             http_rewrites: Vec::new(),
             converters: Vec::new(),
             warned_deprecated: std::collections::HashSet::new(),
@@ -420,17 +424,18 @@ impl Evaluator {
     }
 
     async fn fetch_package_bytes(&mut self, url: &str, extension: &str) -> Result<Vec<u8>> {
-        match self.read_package_cache(url, extension).await {
+        match self.read_package_cache(url, extension).await? {
             Ok(Some(bytes)) => match validate_package_bytes(url, extension, &bytes) {
                 Ok(()) => return Ok(bytes),
                 Err(error) if self.offline => return Err(error),
                 Err(_) => self.remove_package_cache(url, extension).await,
             },
             Ok(None) => {}
-            Err(error) if self.offline => return Err(error),
+            Err(rejection) if self.offline => return Err(rejection.as_error(url)),
             Err(_) => {
-                // The persistent cache is an optimization while online. If it
-                // is unreadable, fetch from the network and continue without it.
+                // The persistent cache is an optimization while online. Evict
+                // the rejected metadata, then fetch from the network.
+                self.remove_package_cache(url, extension).await;
             }
         }
         if self.offline {
@@ -451,26 +456,34 @@ impl Evaluator {
         Ok(bytes)
     }
 
-    async fn read_package_cache(&mut self, url: &str, extension: &str) -> Result<Option<Vec<u8>>> {
-        let Some(cache_dir) = &self.package_cache_dir else {
-            return Ok(None);
+    async fn read_package_cache(
+        &mut self,
+        url: &str,
+        extension: &str,
+    ) -> Result<std::result::Result<Option<Vec<u8>>, crate::package_cache::CacheRejection>> {
+        let Some(cache_dir) = self.package_cache_dir.clone() else {
+            return Ok(Ok(None));
         };
-        let (data_path, url_path) = package_cache_paths(cache_dir, url, extension);
-        let cached_url = match self.capabilities.read_to_string(&url_path).await {
-            Ok(cached_url) => cached_url,
-            Err(Error::Io(_, error)) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(None);
-            }
-            Err(error) => return Err(error),
-        };
-        if cached_url != url {
-            return Ok(None);
+        self.ensure_cache_swept().await?;
+        Ok(crate::package_cache::read_entry(
+            self.capabilities.as_mut(),
+            &cache_dir,
+            url,
+            extension,
+        )
+        .await)
+    }
+
+    /// Reclaim staging files left by interrupted writes, once per evaluator.
+    async fn ensure_cache_swept(&mut self) -> Result<()> {
+        if self.cache_staging_swept {
+            return Ok(());
         }
-        match self.capabilities.read_bytes(&data_path).await {
-            Ok(bytes) => Ok(Some(bytes)),
-            Err(Error::Io(_, error)) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(error),
+        if let Some(cache_dir) = self.package_cache_dir.clone() {
+            crate::package_cache::sweep_staging(self.capabilities.as_mut(), &cache_dir).await?;
         }
+        self.cache_staging_swept = true;
+        Ok(())
     }
 
     /// Cache `bytes` for `url`. The fetch path ignores the error; preloading does not.
@@ -480,18 +493,18 @@ impl Evaluator {
         extension: &str,
         bytes: &[u8],
     ) -> Result<()> {
-        let Some(cache_dir) = &self.package_cache_dir else {
+        let Some(cache_dir) = self.package_cache_dir.clone() else {
             return Ok(());
         };
-        let (data_path, url_path) = package_cache_paths(cache_dir, url, extension);
-        let Some(parent) = data_path.parent() else {
-            return Ok(());
-        };
-        self.capabilities.create_dir_all(parent).await?;
-        self.capabilities.write_atomic(&data_path, bytes).await?;
-        self.capabilities
-            .write_atomic(&url_path, url.as_bytes())
-            .await
+        self.ensure_cache_swept().await?;
+        crate::package_cache::write_entry(
+            self.capabilities.as_mut(),
+            &cache_dir,
+            url,
+            extension,
+            bytes,
+        )
+        .await
     }
 
     /// Seed the persistent package cache with `bytes` for `url`.
@@ -509,7 +522,7 @@ impl Evaluator {
         if self.package_cache_dir.is_none() {
             return Ok(());
         }
-        if let Ok(Some(cached)) = self.read_package_cache(url, extension).await
+        if let Ok(Ok(Some(cached))) = self.read_package_cache(url, extension).await
             && validate_package_bytes(url, extension, &cached).is_ok()
         {
             return Ok(());
@@ -524,12 +537,11 @@ impl Evaluator {
     }
 
     async fn remove_package_cache(&mut self, url: &str, extension: &str) {
-        let Some(cache_dir) = &self.package_cache_dir else {
+        let Some(cache_dir) = self.package_cache_dir.clone() else {
             return;
         };
-        let (data_path, url_path) = package_cache_paths(cache_dir, url, extension);
-        let _ = self.capabilities.remove_file(&data_path).await;
-        let _ = self.capabilities.remove_file(&url_path).await;
+        crate::package_cache::evict_metadata(self.capabilities.as_mut(), &cache_dir, url, extension)
+            .await;
     }
 
     /// Download a package zip and extract it to a temp directory.
@@ -5612,19 +5624,6 @@ enum PackageSource {
     Direct { url: String, root: String },
     /// Zip archive URL + path within the archive
     Zip(String, String),
-}
-
-fn package_cache_paths(cache_dir: &Path, url: &str, extension: &str) -> (PathBuf, PathBuf) {
-    // FNV-1a gives package URLs stable, filesystem-safe names without making
-    // the cache layout depend on platform path rules. The adjacent URL file
-    // detects the extraordinarily unlikely hash collision.
-    let mut hash = 0xcbf29ce484222325_u64;
-    for byte in url.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    let base = cache_dir.join("packages").join(format!("{hash:016x}"));
-    (base.with_extension(extension), base.with_extension("url"))
 }
 
 fn validate_package_bytes(url: &str, extension: &str, bytes: &[u8]) -> Result<()> {

@@ -10,6 +10,26 @@ use crate::Result;
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
 
+/// Boundary at which a durable cache write is made to fail.
+///
+/// This is the narrow dependency-injection seam used by the cache contract
+/// tests: embedders never need it, and evaluation semantics do not depend on
+/// it. `Blob*` boundaries are only crossed while committing a package blob and
+/// `Metadata*` boundaries only while committing its metadata sidecar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheWriteFault {
+    /// `create` of the staging file failed.
+    Create,
+    /// `write`/`flush` of the staging bytes failed.
+    Flush,
+    /// `fsync` of the staging file failed.
+    FileSync,
+    /// `rename` of the staging file to its destination failed.
+    Rename,
+    /// `fsync` of the destination directory failed (metadata commit only).
+    DirSync,
+}
+
 /// Host-provided IO for evaluating Pkl modules.
 ///
 /// The default evaluator still uses the native implementation, but embedders
@@ -48,6 +68,51 @@ pub trait EvalCapabilities: Send + Sync {
     fn remove_file<'a>(&'a mut self, path: &'a Path) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
             std::fs::remove_file(path).map_err(|error| crate::Error::Io(path.to_path_buf(), error))
+        })
+    }
+
+    /// List directory entries. Defaults to the native filesystem.
+    fn list_dir<'a>(&'a mut self, path: &'a Path) -> BoxFuture<'a, Result<Vec<PathBuf>>> {
+        Box::pin(async move {
+            match std::fs::read_dir(path) {
+                Ok(entries) => {
+                    let mut paths = Vec::new();
+                    for entry in entries {
+                        let entry = entry.map_err(|error| {
+                            crate::Error::Io(path.to_path_buf(), error)
+                        })?;
+                        paths.push(entry.path());
+                    }
+                    Ok(paths)
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+                Err(error) => Err(crate::Error::Io(path.to_path_buf(), error)),
+            }
+        })
+    }
+
+    /// Inject a failure at a durable-write boundary. The default
+    /// implementation never fails; test capabilities override it.
+    fn cache_write_fault(&mut self, _fault: CacheWriteFault) -> Result<()> {
+        Ok(())
+    }
+
+    /// Commit `bytes` to `destination` via a staging file in `staging_dir`.
+    ///
+    /// The sequence is: ensure the destination parent exists, create a
+    /// staging file, write + flush + fsync it, rename it into place, and
+    /// fsync the destination directory when `sync_dir` is set. Each boundary
+    /// consults [`EvalCapabilities::cache_write_fault`] so cache write
+    /// failures can be injected without changing public evaluation semantics.
+    fn durable_write<'a>(
+        &'a mut self,
+        destination: &'a Path,
+        staging_dir: &'a Path,
+        bytes: &'a [u8],
+        sync_dir: bool,
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            durable_write_default(self, destination, staging_dir, bytes, sync_dir).await
         })
     }
 
@@ -307,6 +372,25 @@ impl EvalCapabilities for NativeCapabilities {
         })
     }
 
+    fn list_dir<'a>(&'a mut self, path: &'a Path) -> BoxFuture<'a, Result<Vec<PathBuf>>> {
+        Box::pin(async move {
+            #[cfg(feature = "async")]
+            {
+                if tokio::runtime::Handle::try_current().is_err() {
+                    return list_dir_sync(path);
+                }
+                let path = path.to_path_buf();
+                tokio::task::spawn_blocking(move || list_dir_sync(&path))
+                    .await
+                    .map_err(|error| {
+                        crate::Error::Eval(format!("list directory task failed: {error}"))
+                    })?
+            }
+            #[cfg(not(feature = "async"))]
+            list_dir_sync(path)
+        })
+    }
+
     fn read_env<'a>(&'a mut self, name: &'a str) -> BoxFuture<'a, Result<Option<String>>> {
         Box::pin(async move { Ok(std::env::var(name).ok()) })
     }
@@ -512,6 +596,80 @@ fn blocking_http_error(url: &str, error: ureq::Error) -> crate::Error {
 }
 
 #[cfg(feature = "native-io")]
+fn list_dir_sync(path: &Path) -> Result<Vec<PathBuf>> {
+    match std::fs::read_dir(path) {
+        Ok(entries) => {
+            let mut paths = Vec::new();
+            for entry in entries {
+                let entry = entry.map_err(|error| crate::Error::Io(path.to_path_buf(), error))?;
+                paths.push(entry.path());
+            }
+            Ok(paths)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => Err(crate::Error::Io(path.to_path_buf(), error)),
+    }
+}
+
+/// Generic durable-write protocol shared by the trait default and the
+/// off-runtime branch of the native capabilities. It never recurses through
+/// `EvalCapabilities::durable_write`; only the narrower primitives
+/// (`create_dir_all`, `cache_write_fault`) are dispatched virtually.
+async fn durable_write_default<T: EvalCapabilities + ?Sized>(
+    capabilities: &mut T,
+    destination: &Path,
+    staging_dir: &Path,
+    bytes: &[u8],
+    sync_dir: bool,
+) -> Result<()> {
+    use std::io::Write;
+
+    if let Some(parent) = destination.parent() {
+        capabilities.create_dir_all(parent).await?;
+    }
+    capabilities.create_dir_all(staging_dir).await?;
+    let staging_name =
+        crate::package_cache::staging_name(destination).unwrap_or_else(|| "stage".to_string());
+    let staging = staging_dir.join(staging_name);
+
+    capabilities.cache_write_fault(CacheWriteFault::Create)?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&staging)
+        .map_err(|error| crate::Error::Io(staging.clone(), error))?;
+
+    capabilities.cache_write_fault(CacheWriteFault::Flush)?;
+    file.write_all(bytes)
+        .and_then(|()| file.flush())
+        .map_err(|error| crate::Error::Io(staging.clone(), error))?;
+
+    capabilities.cache_write_fault(CacheWriteFault::FileSync)?;
+    file.sync_all()
+        .map_err(|error| crate::Error::Io(staging.clone(), error))?;
+    drop(file);
+
+    capabilities.cache_write_fault(CacheWriteFault::Rename)?;
+    // Windows rename cannot replace; fall back to remove-then-rename there,
+    // matching the atomic writer used elsewhere in pklr.
+    match std::fs::rename(&staging, destination) {
+        Ok(()) => {}
+        Err(_) if destination.exists() => {
+            std::fs::remove_file(destination)
+                .and_then(|()| std::fs::rename(&staging, destination))
+                .map_err(|error| crate::Error::Io(destination.to_path_buf(), error))?;
+        }
+        Err(error) => return Err(crate::Error::Io(destination.to_path_buf(), error)),
+    }
+
+    if sync_dir {
+        capabilities.cache_write_fault(CacheWriteFault::DirSync)?;
+        sync_parent_dir(destination)?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "native-io")]
 static TEMP_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(feature = "native-io")]
@@ -535,6 +693,22 @@ fn unique_temp_dir(prefix: &str) -> Result<PathBuf> {
         "mkdir failed for {}: unable to create a unique directory",
         base.join(prefix).display()
     )))
+}
+
+
+/// Fsync the parent directory so a metadata rename is durable. Best-effort on
+/// platforms where directory handles cannot be synced.
+fn sync_parent_dir(destination: &Path) -> Result<()> {
+    let Some(parent) = destination.parent() else {
+        return Ok(());
+    };
+    match std::fs::File::open(parent) {
+        Ok(dir) => dir
+            .sync_all()
+            .map_err(|error| crate::Error::Io(parent.to_path_buf(), error)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(crate::Error::Io(parent.to_path_buf(), error)),
+    }
 }
 
 #[cfg(feature = "package-zip-core")]

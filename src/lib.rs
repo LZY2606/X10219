@@ -1,5 +1,9 @@
 #[cfg(feature = "eval-core")]
 pub mod capabilities;
+#[cfg(feature = "eval-core")]
+mod package_cache;
+#[cfg(feature = "eval-core")]
+mod sha256;
 pub mod error;
 #[cfg(feature = "eval-core")]
 pub mod eval;
@@ -10,6 +14,8 @@ pub mod value;
 
 #[cfg(feature = "blocking")]
 pub use capabilities::BlockingCapabilities;
+#[cfg(feature = "eval-core")]
+pub use capabilities::CacheWriteFault;
 #[cfg(feature = "eval-core")]
 pub use capabilities::EvalCapabilities;
 #[cfg(feature = "native-io")]
