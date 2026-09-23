@@ -27,6 +27,8 @@ pub struct Evaluator {
     module_scopes: HashMap<PathBuf, ModuleScopeSnapshot>,
     /// Environment variables read during evaluation (name → observed value).
     env_reads: BTreeMap<String, Option<String>>,
+    /// System properties read during evaluation (name → observed value).
+    prop_reads: BTreeMap<String, Option<String>>,
     /// Local files currently being evaluated with inherited scope.
     scoped_imports_in_flight: HashSet<PathBuf>,
     /// Host-provided IO for files, environment, HTTP, packages, and globs.
@@ -36,6 +38,8 @@ pub struct Evaluator {
     package_dirs: HashMap<String, PathBuf>,
     /// Directory used to persist downloaded package content across evaluators.
     package_cache_dir: Option<PathBuf>,
+    /// Whether the package cache directory has been prepared for this evaluator.
+    package_cache_ready: bool,
     /// HTTP URL roots whose sources belong to direct-download packages.
     package_http_roots: HashSet<String>,
     /// Whether network access is disabled for this evaluator.
@@ -82,6 +86,7 @@ impl Default for Evaluator {
             import_cache: HashMap::new(),
             module_scopes: HashMap::new(),
             env_reads: BTreeMap::new(),
+            prop_reads: BTreeMap::new(),
             scoped_imports_in_flight: HashSet::new(),
             #[cfg(feature = "blocking")]
             capabilities: Box::new(crate::capabilities::BlockingCapabilities::new()),
@@ -90,6 +95,7 @@ impl Default for Evaluator {
             #[cfg(feature = "package-zip-core")]
             package_dirs: HashMap::new(),
             package_cache_dir: None,
+            package_cache_ready: false,
             package_http_roots: HashSet::new(),
             offline: false,
             http_rewrites: Vec::new(),
@@ -120,11 +126,13 @@ impl Evaluator {
             import_cache: HashMap::new(),
             module_scopes: HashMap::new(),
             env_reads: BTreeMap::new(),
+            prop_reads: BTreeMap::new(),
             scoped_imports_in_flight: HashSet::new(),
             capabilities: Box::new(capabilities),
             #[cfg(feature = "package-zip-core")]
             package_dirs: HashMap::new(),
             package_cache_dir: None,
+            package_cache_ready: false,
             package_http_roots: HashSet::new(),
             offline: false,
             http_rewrites: Vec::new(),
@@ -183,6 +191,11 @@ impl Evaluator {
         &self.env_reads
     }
 
+    /// Return the system properties observed by the latest evaluation.
+    pub fn prop_reads(&self) -> &BTreeMap<String, Option<String>> {
+        &self.prop_reads
+    }
+
     #[cfg(feature = "native-io")]
     pub(crate) fn take_env_reads(&mut self) -> BTreeMap<String, Option<String>> {
         std::mem::take(&mut self.env_reads)
@@ -190,6 +203,7 @@ impl Evaluator {
 
     fn begin_evaluation(&mut self) {
         self.env_reads.clear();
+        self.prop_reads.clear();
         self.import_cache.clear();
         self.module_scopes.clear();
         self.scoped_imports_in_flight.clear();
@@ -280,10 +294,16 @@ impl Evaluator {
             };
             Ok(Value::String(val))
         } else if let Some(prop_name) = uri.strip_prefix("prop:") {
-            // prop: — system properties (not standard in Rust, return empty)
-            Err(Error::Eval(format!(
-                "system property not available: {prop_name}"
-            )))
+            // prop: — host system properties. Only keys actually evaluated
+            // reach here; short-circuited branches never record a read.
+            let value = self.capabilities.read_property(prop_name).await?;
+            self.prop_reads.insert(prop_name.to_string(), value.clone());
+            let Some(val) = value else {
+                return Err(Error::Eval(format!(
+                    "system property not available: {prop_name}"
+                )));
+            };
+            Ok(Value::String(val))
         } else if uri.starts_with("https://") || uri.starts_with("http://") {
             // HTTP/HTTPS
             let content = self.fetch_source(uri).await?;
@@ -451,26 +471,75 @@ impl Evaluator {
         Ok(bytes)
     }
 
-    async fn read_package_cache(&mut self, url: &str, extension: &str) -> Result<Option<Vec<u8>>> {
-        let Some(cache_dir) = &self.package_cache_dir else {
-            return Ok(None);
+    async fn ensure_package_cache_ready(&mut self) -> Result<bool> {
+        let Some(cache_dir) = self.package_cache_dir.clone() else {
+            return Ok(false);
         };
-        let (data_path, url_path) = package_cache_paths(cache_dir, url, extension);
-        let cached_url = match self.capabilities.read_to_string(&url_path).await {
-            Ok(cached_url) => cached_url,
+        if self.package_cache_ready {
+            return Ok(true);
+        }
+        let packages_dir = cache_dir.join("packages");
+        self.capabilities.create_dir_all(&packages_dir).await?;
+        // Reclaim staging files from earlier processes before any lookup so a
+        // temp file can never be mistaken for a committed entry.
+        let mut stale = match self.capabilities.list_directory(&packages_dir).await {
+            Ok(entries) => entries,
+            Err(Error::Io(_, error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                Vec::new()
+            }
+            Err(error) => return Err(error),
+        };
+        stale.retain(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.contains(crate::package_cache::TEMP_FILE_MARKER))
+        });
+        for path in stale {
+            let _ = self.capabilities.remove_file(&path).await;
+        }
+        self.package_cache_ready = true;
+        Ok(true)
+    }
+
+    async fn read_package_cache(&mut self, url: &str, extension: &str) -> Result<Option<Vec<u8>>> {
+        if !self.ensure_package_cache_ready().await? {
+            return Ok(None);
+        }
+        let cache_dir = self.package_cache_dir.clone().expect("cache dir just ensured");
+        let (blob_path, metadata_path) =
+            crate::package_cache::package_cache_paths(&cache_dir, url, extension);
+        let metadata_text = match self.capabilities.read_to_string(&metadata_path).await {
+            Ok(text) => text,
             Err(Error::Io(_, error)) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(None);
             }
             Err(error) => return Err(error),
         };
-        if cached_url != url {
-            return Ok(None);
+        let (resolved_blob, expected_digest) = crate::package_cache::parse_metadata(
+            &metadata_text,
+            url,
+            extension,
+            &cache_dir,
+        )?;
+        if resolved_blob != blob_path {
+            return Err(Error::Eval(
+                "corrupt package cache metadata: blob path does not match cache key".to_string(),
+            ));
         }
-        match self.capabilities.read_bytes(&data_path).await {
-            Ok(bytes) => Ok(Some(bytes)),
-            Err(Error::Io(_, error)) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(error),
+        let bytes = match self.capabilities.read_bytes(&blob_path).await {
+            Ok(bytes) => bytes,
+            Err(Error::Io(_, error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        let actual_digest = crate::package_cache::digest::sha256_hex(&bytes);
+        if actual_digest != expected_digest {
+            return Err(Error::Eval(format!(
+                "package cache digest mismatch for {url}: expected {expected_digest}, found {actual_digest}"
+            )));
         }
+        Ok(Some(bytes))
     }
 
     /// Cache `bytes` for `url`. The fetch path ignores the error; preloading does not.
@@ -480,18 +549,54 @@ impl Evaluator {
         extension: &str,
         bytes: &[u8],
     ) -> Result<()> {
-        let Some(cache_dir) = &self.package_cache_dir else {
+        if !self.ensure_package_cache_ready().await? {
             return Ok(());
-        };
-        let (data_path, url_path) = package_cache_paths(cache_dir, url, extension);
-        let Some(parent) = data_path.parent() else {
-            return Ok(());
-        };
-        self.capabilities.create_dir_all(parent).await?;
-        self.capabilities.write_atomic(&data_path, bytes).await?;
+        }
+        let cache_dir = self.package_cache_dir.clone().expect("cache dir just ensured");
+        let metadata_bytes =
+            crate::package_cache::encode_metadata(url, extension, bytes);
+        self.commit_package_cache_entry(
+            &crate::package_cache::package_cache_paths(&cache_dir, url, extension).0,
+            bytes,
+            crate::package_cache::CacheFile::Blob,
+        )
+        .await?;
+        self.commit_package_cache_entry(
+            &crate::package_cache::package_cache_paths(&cache_dir, url, extension).1,
+            &metadata_bytes,
+            crate::package_cache::CacheFile::Metadata,
+        )
+        .await
+    }
+
+    /// Run the write → flush → rename → directory-sync pipeline for one cache
+    /// file. A failure leaves at most a staging temp file behind; the
+    /// destination is never half-written.
+    async fn commit_package_cache_entry(
+        &mut self,
+        destination: &Path,
+        bytes: &[u8],
+        file: crate::package_cache::CacheFile,
+    ) -> Result<()> {
+        if let Some(parent) = destination.parent() {
+            self.capabilities.create_dir_all(parent).await?;
+        }
+        let temp_path = crate::package_cache::temp_sibling_for(destination);
         self.capabilities
-            .write_atomic(&url_path, url.as_bytes())
-            .await
+            .cache_write_file(&temp_path, bytes, file)
+            .await?;
+        self.capabilities
+            .cache_flush_file(&temp_path, file)
+            .await?;
+        self.capabilities
+            .cache_rename_file(&temp_path, destination, file)
+            .await?;
+        if let Some(parent) = destination.parent() {
+            self.capabilities
+                .cache_sync_directory(parent, file)
+                .await?;
+        }
+        Ok(())
     }
 
     /// Seed the persistent package cache with `bytes` for `url`.
@@ -527,9 +632,10 @@ impl Evaluator {
         let Some(cache_dir) = &self.package_cache_dir else {
             return;
         };
-        let (data_path, url_path) = package_cache_paths(cache_dir, url, extension);
-        let _ = self.capabilities.remove_file(&data_path).await;
-        let _ = self.capabilities.remove_file(&url_path).await;
+        let (blob_path, metadata_path) =
+            crate::package_cache::package_cache_paths(cache_dir, url, extension);
+        let _ = self.capabilities.remove_file(&blob_path).await;
+        let _ = self.capabilities.remove_file(&metadata_path).await;
     }
 
     /// Download a package zip and extract it to a temp directory.
@@ -5612,19 +5718,6 @@ enum PackageSource {
     Direct { url: String, root: String },
     /// Zip archive URL + path within the archive
     Zip(String, String),
-}
-
-fn package_cache_paths(cache_dir: &Path, url: &str, extension: &str) -> (PathBuf, PathBuf) {
-    // FNV-1a gives package URLs stable, filesystem-safe names without making
-    // the cache layout depend on platform path rules. The adjacent URL file
-    // detects the extraordinarily unlikely hash collision.
-    let mut hash = 0xcbf29ce484222325_u64;
-    for byte in url.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    let base = cache_dir.join("packages").join(format!("{hash:016x}"));
-    (base.with_extension(extension), base.with_extension("url"))
 }
 
 fn validate_package_bytes(url: &str, extension: &str, bytes: &[u8]) -> Result<()> {

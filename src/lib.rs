@@ -3,6 +3,8 @@ pub mod capabilities;
 pub mod error;
 #[cfg(feature = "eval-core")]
 pub mod eval;
+#[cfg(feature = "eval-core")]
+pub(crate) mod package_cache;
 pub mod lexer;
 pub mod parser;
 #[cfg(feature = "eval-core")]

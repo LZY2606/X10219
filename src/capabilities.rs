@@ -7,6 +7,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::Result;
+#[cfg(feature = "eval-core")]
+/// Which half of a package cache entry a storage boundary touches.
+#[cfg(feature = "eval-core")]
+pub use crate::package_cache::{CacheFile, CacheStage};
+
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
 
@@ -51,6 +56,121 @@ pub trait EvalCapabilities: Send + Sync {
         })
     }
 
+    /// List the immediate children of a directory. Used to reclaim staging
+    /// files left in the package cache by an interrupted previous run.
+    #[cfg(feature = "eval-core")]
+    fn list_directory<'a>(
+        &'a mut self,
+        dir: &'a Path,
+    ) -> BoxFuture<'a, Result<Vec<PathBuf>>> {
+        Box::pin(async move {
+            let entries = std::fs::read_dir(dir)
+                .map_err(|error| crate::Error::Io(dir.to_path_buf(), error))?;
+            let mut paths = Vec::new();
+            for entry in entries {
+                let entry = entry.map_err(|error| crate::Error::Io(dir.to_path_buf(), error))?;
+                paths.push(entry.path());
+            }
+            Ok(paths)
+        })
+    }
+
+    /// Create a new staging file and write `bytes` into it (cache "write"
+    /// boundary). The default implementation does not flush or rename.
+    #[cfg(feature = "eval-core")]
+    fn cache_write_file<'a>(
+        &'a mut self,
+        temp_path: &'a Path,
+        bytes: &'a [u8],
+        _file: CacheFile,
+    ) -> BoxFuture<'a, Result<()>> {
+        use std::io::Write;
+        Box::pin(async move {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(temp_path)
+                .map_err(|error| crate::Error::Io(temp_path.to_path_buf(), error))?;
+            match file.write_all(bytes) {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    drop(file);
+                    let _ = std::fs::remove_file(temp_path);
+                    Err(crate::Error::Io(temp_path.to_path_buf(), error))
+                }
+            }
+        })
+    }
+
+    /// Flush a staging file's contents to stable storage (cache "flush"
+    /// boundary).
+    #[cfg(feature = "eval-core")]
+    fn cache_flush_file<'a>(
+        &'a mut self,
+        temp_path: &'a Path,
+        _file: CacheFile,
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(temp_path)
+                .map_err(|error| crate::Error::Io(temp_path.to_path_buf(), error))?;
+            match file.sync_all() {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    drop(file);
+                    let _ = std::fs::remove_file(temp_path);
+                    Err(crate::Error::Io(temp_path.to_path_buf(), error))
+                }
+            }
+        })
+    }
+
+    /// Publish a staging file at its final path (cache "rename" boundary).
+    #[cfg(feature = "eval-core")]
+    fn cache_rename_file<'a>(
+        &'a mut self,
+        temp_path: &'a Path,
+        destination: &'a Path,
+        _file: CacheFile,
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            match std::fs::rename(temp_path, destination) {
+                Ok(()) => Ok(()),
+                // Windows rename cannot replace; fall back like write_atomic.
+                Err(_) if destination.exists() => std::fs::remove_file(destination)
+                    .and_then(|()| std::fs::rename(temp_path, destination))
+                    .map_err(|error| crate::Error::Io(destination.to_path_buf(), error)),
+                Err(error) => Err(crate::Error::Io(destination.to_path_buf(), error)),
+            }
+        })
+    }
+
+    /// Flush the directory that now holds a freshly renamed cache entry
+    /// (cache "directory sync" boundary). Defaults to a no-op on platforms
+    /// without directory fsync semantics.
+    #[cfg(feature = "eval-core")]
+    fn cache_sync_directory<'a>(
+        &'a mut self,
+        dir: &'a Path,
+        _file: CacheFile,
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            #[cfg(unix)]
+            {
+                let file = std::fs::File::open(dir)
+                    .map_err(|error| crate::Error::Io(dir.to_path_buf(), error))?;
+                file.sync_all()
+                    .map_err(|error| crate::Error::Io(dir.to_path_buf(), error))?;
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = dir;
+            }
+            Ok(())
+        })
+    }
+
     #[cfg(feature = "package-zip-core")]
     fn extract_zip<'a>(
         &'a mut self,
@@ -61,6 +181,17 @@ pub trait EvalCapabilities: Send + Sync {
     }
 
     fn read_env<'a>(&'a mut self, name: &'a str) -> BoxFuture<'a, Result<Option<String>>>;
+
+    /// Read a system property (`prop:` resources). Hosts without system
+    /// properties return `Ok(None)`; evaluation then reports the missing
+    /// property. Unlike environment variables, property reads are opt-in host
+    /// state, so the call goes through capabilities and is observable there.
+    fn read_property<'a>(
+        &'a mut self,
+        _name: &'a str,
+    ) -> BoxFuture<'a, Result<Option<String>>> {
+        Box::pin(async { Ok(None) })
+    }
 
     fn fetch_text<'a>(&'a mut self, url: &'a str) -> BoxFuture<'a, Result<String>>;
 

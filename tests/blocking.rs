@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use pklr::capabilities::BoxFuture;
+use pklr::capabilities::{BoxFuture, CacheFile};
 use pklr::{EvalCapabilities, Evaluator};
 
 #[derive(Clone, Default)]
@@ -58,6 +58,54 @@ impl EvalCapabilities for MemoryCacheCapabilities {
             .lock()
             .unwrap()
             .insert(path.to_path_buf(), bytes.to_vec());
+        Box::pin(async { Ok(()) })
+    }
+
+    fn list_directory<'a>(
+        &'a mut self,
+        _dir: &'a Path,
+    ) -> BoxFuture<'a, pklr::Result<Vec<PathBuf>>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
+    fn cache_write_file<'a>(
+        &'a mut self,
+        temp_path: &'a Path,
+        bytes: &'a [u8],
+        _file: CacheFile,
+    ) -> BoxFuture<'a, pklr::Result<()>> {
+        self.files
+            .lock()
+            .unwrap()
+            .insert(temp_path.to_path_buf(), bytes.to_vec());
+        Box::pin(async { Ok(()) })
+    }
+
+    fn cache_flush_file<'a>(
+        &'a mut self,
+        _temp_path: &'a Path,
+        _file: CacheFile,
+    ) -> BoxFuture<'a, pklr::Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn cache_rename_file<'a>(
+        &'a mut self,
+        temp_path: &'a Path,
+        destination: &'a Path,
+        _file: CacheFile,
+    ) -> BoxFuture<'a, pklr::Result<()>> {
+        let mut files = self.files.lock().unwrap();
+        let bytes = files.remove(temp_path).unwrap_or_default();
+        files.insert(destination.to_path_buf(), bytes);
+        Box::pin(async { Ok(()) })
+    }
+
+    fn cache_sync_directory<'a>(
+        &'a mut self,
+        _dir: &'a Path,
+        _file: CacheFile,
+    ) -> BoxFuture<'a, pklr::Result<()>> {
         Box::pin(async { Ok(()) })
     }
 
@@ -339,11 +387,19 @@ fn blocking_preload_uses_custom_capabilities() {
     let files = files.lock().unwrap();
     assert_eq!(files.len(), 2);
     assert!(files.values().any(|value| value == b"answer = 42\n"));
+    let metadata = files
+        .iter()
+        .find_map(|(path, value)| {
+            path.to_string_lossy().ends_with(".meta.json").then_some(value)
+        })
+        .expect("a versioned metadata file is written");
+    let metadata = std::str::from_utf8(metadata).unwrap();
+    assert!(metadata.contains("\"version\":1"), "{metadata}");
     assert!(
-        files
-            .values()
-            .any(|value| value == b"https://example.com/pkg@1.0.0.pkl")
+        metadata.contains("https://example.com/pkg@1.0.0.pkl"),
+        "{metadata}"
     );
+    assert!(metadata.contains("\"digest\":\""), "{metadata}");
 }
 
 #[test]
