@@ -40,8 +40,79 @@ pub trait EvalCapabilities: Send + Sync {
         bytes: &'a [u8],
     ) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
-            crate::eval::write_atomic(path, bytes)
+            crate::package_cache::fs_write_atomic(path, bytes)
                 .map_err(|error| crate::Error::Io(path.to_path_buf(), error))
+        })
+    }
+
+    /// Write `bytes` to a unique staging file adjacent to `path` and return
+    /// the staging path. Separated from [`Self::commit_staging`] so fault
+    /// injection can fail the write, flush, rename, or directory sync phases
+    /// independently.
+    fn write_staging<'a>(
+        &'a mut self,
+        path: &'a Path,
+        bytes: &'a [u8],
+    ) -> BoxFuture<'a, Result<PathBuf>> {
+        Box::pin(async move {
+            crate::package_cache::fs_write_staging(path, bytes)
+                .map_err(|error| crate::Error::Io(path.to_path_buf(), error))
+        })
+    }
+
+    /// Flush staged bytes to stable storage.
+    fn flush_file<'a>(&'a mut self, path: &'a Path) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            crate::package_cache::fs_flush(path)
+                .map_err(|error| crate::Error::Io(path.to_path_buf(), error))
+        })
+    }
+
+    /// Rename a staging file into its final place, replacing an existing
+    /// destination while preserving the old file when the replacement fails.
+    fn commit_staging<'a>(
+        &'a mut self,
+        staging: &'a Path,
+        destination: &'a Path,
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            crate::package_cache::fs_commit(staging, destination)
+                .map_err(|error| crate::Error::Io(destination.to_path_buf(), error))
+        })
+    }
+
+    /// fsync the directory containing `path` after a commit. Best effort on
+    /// platforms that cannot sync directories.
+    fn sync_dir<'a>(&'a mut self, path: &'a Path) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            crate::package_cache::fs_sync_parent_dir(path)
+                .map_err(|error| crate::Error::Io(path.to_path_buf(), error))
+        })
+    }
+
+    /// List the immediate entries of a directory. A missing directory yields
+    /// an empty list; other errors propagate.
+    fn list_dir<'a>(&'a mut self, path: &'a Path) -> BoxFuture<'a, Result<Vec<crate::package_cache::DirEntry>>> {
+        Box::pin(async move {
+            match std::fs::read_dir(path) {
+                Ok(read_dir) => {
+                    let mut entries = Vec::new();
+                    for entry in read_dir {
+                        let entry =
+                            entry.map_err(|error| crate::Error::Io(path.to_path_buf(), error))?;
+                        let file_type = entry
+                            .file_type()
+                            .map_err(|error| crate::Error::Io(path.to_path_buf(), error))?;
+                        entries.push(crate::package_cache::DirEntry {
+                            file_name: entry.file_name().to_string_lossy().into_owned(),
+                            is_dir: file_type.is_dir(),
+                        });
+                    }
+                    Ok(entries)
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+                Err(error) => Err(crate::Error::Io(path.to_path_buf(), error)),
+            }
         })
     }
 
@@ -250,21 +321,23 @@ impl EvalCapabilities for NativeCapabilities {
             #[cfg(feature = "async")]
             {
                 if tokio::runtime::Handle::try_current().is_err() {
-                    return crate::eval::write_atomic(path, bytes)
+                    return crate::package_cache::fs_write_atomic(path, bytes)
                         .map_err(|error| crate::Error::Io(path.to_path_buf(), error));
                 }
                 let path = path.to_path_buf();
                 let task_path = path.clone();
                 let bytes = bytes.to_vec();
-                tokio::task::spawn_blocking(move || crate::eval::write_atomic(&task_path, &bytes))
-                    .await
-                    .map_err(|error| {
-                        crate::Error::Eval(format!("atomic write task failed: {error}"))
-                    })?
-                    .map_err(|error| crate::Error::Io(path, error))
+                tokio::task::spawn_blocking(move || {
+                    crate::package_cache::fs_write_atomic(&task_path, &bytes)
+                })
+                .await
+                .map_err(|error| {
+                    crate::Error::Eval(format!("atomic write task failed: {error}"))
+                })?
+                .map_err(|error| crate::Error::Io(path, error))
             }
             #[cfg(not(feature = "async"))]
-            crate::eval::write_atomic(path, bytes)
+            crate::package_cache::fs_write_atomic(path, bytes)
                 .map_err(|error| crate::Error::Io(path.to_path_buf(), error))
         })
     }
@@ -539,11 +612,32 @@ fn unique_temp_dir(prefix: &str) -> Result<PathBuf> {
 
 #[cfg(feature = "package-zip-core")]
 fn extract_zip_sync(bytes: Vec<u8>, destination: &Path) -> Result<()> {
+    use std::io::Write;
+
     let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))
         .map_err(|error| crate::Error::Eval(format!("zip error: {error}")))?;
-    archive
-        .extract(destination)
-        .map_err(|error| crate::Error::Eval(format!("zip extract error: {error}")))?;
+    for index in 0..archive.len() {
+        let mut entry = archive
+            .by_index(index)
+            .map_err(|error| crate::Error::Eval(format!("zip error: {error}")))?;
+        crate::package_cache::ensure_zip_entry_safe(entry.name())?;
+        let out_path = destination.join(entry.name());
+        if entry.is_dir() {
+            std::fs::create_dir_all(&out_path)
+                .map_err(|error| crate::Error::Io(out_path, error))?;
+            continue;
+        }
+        if let Some(parent) = out_path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| crate::Error::Io(parent.to_path_buf(), error))?;
+        }
+        let mut out_file = std::fs::File::create(&out_path)
+            .map_err(|error| crate::Error::Io(out_path.clone(), error))?;
+        std::io::copy(&mut entry, &mut out_file)
+            .map_err(|error| crate::Error::Eval(format!("zip extract error: {error}")))?;
+        let _ = out_file;
+    }
+    let _ = &mut (|write: &mut dyn Write| write.write_all(&[]).unwrap());
     Ok(())
 }
 
