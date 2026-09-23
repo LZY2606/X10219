@@ -5652,43 +5652,7 @@ fn validate_package_bytes(url: &str, extension: &str, bytes: &[u8]) -> Result<()
 }
 
 pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("cache");
-    let temp_path = path.with_file_name(format!(
-        ".{file_name}.tmp-{}-{}",
-        std::process::id(),
-        COUNTER.fetch_add(1, Ordering::Relaxed)
-    ));
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temp_path)?;
-    let write_result = file.write_all(bytes).and_then(|()| file.sync_all());
-    drop(file);
-    if let Err(error) = write_result {
-        let _ = std::fs::remove_file(&temp_path);
-        return Err(error);
-    }
-    let rename_result = match std::fs::rename(&temp_path, path) {
-        Ok(()) => return Ok(()),
-        // Windows rename does not replace an existing file. There is a brief
-        // non-atomic gap on that platform, but the destination must not retain
-        // stale bytes while its URL sidecar is updated.
-        Err(_) if path.exists() => {
-            std::fs::remove_file(path).and_then(|()| std::fs::rename(&temp_path, path))
-        }
-        Err(error) => Err(error),
-    };
-    if rename_result.is_err() {
-        let _ = std::fs::remove_file(temp_path);
-    }
-    rename_result
+    crate::atomic_io::write_atomic(path, bytes)
 }
 
 /// Resolve a `package://` URI to a download source.

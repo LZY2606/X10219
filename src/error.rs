@@ -50,6 +50,9 @@ pub enum Error {
     #[error("Eval error: {0}")]
     Eval(String),
 
+    #[error("Package cache error: {0}")]
+    PackageCache(String),
+
     #[error("Import not found: {0}")]
     ImportNotFound(String),
 
