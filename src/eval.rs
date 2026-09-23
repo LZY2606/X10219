@@ -99,6 +99,18 @@ impl Default for Evaluator {
     }
 }
 
+#[cfg(feature = "package-zip-core")]
+impl Drop for Evaluator {
+    fn drop(&mut self) {
+        // Extracted package zips live in per-evaluator temp directories;
+        // reclaim them so evaluations never leak temp directories. Hosts with
+        // virtual temp dirs simply miss here and are unaffected.
+        for dir in self.package_dirs.values() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+}
+
 impl Evaluator {
     /// Construct an evaluator with synchronous host capabilities.
     #[cfg(feature = "blocking")]
@@ -167,7 +179,11 @@ impl Evaluator {
 
     /// Persist downloaded package content under `path`.
     pub fn set_package_cache_dir(&mut self, path: impl Into<PathBuf>) {
-        self.package_cache_dir = Some(path.into());
+        let path = path.into();
+        // A new evaluator is a fresh "startup": leftover temp files from
+        // interrupted atomic writes are recognized and cleaned up.
+        let _ = cleanup_stale_temp_files(&path.join("packages"));
+        self.package_cache_dir = Some(path);
     }
 
     /// Disable network access. Package imports can still use the persistent cache.
@@ -429,8 +445,11 @@ impl Evaluator {
             Ok(None) => {}
             Err(error) if self.offline => return Err(error),
             Err(_) => {
-                // The persistent cache is an optimization while online. If it
-                // is unreadable, fetch from the network and continue without it.
+                // The persistent cache is an optimization while online. A
+                // rejected entry (corrupt metadata, digest mismatch,
+                // unsupported version) is removed so later runs do not keep
+                // consulting it, then content is fetched from the network.
+                self.remove_package_cache(url, extension).await;
             }
         }
         if self.offline {
@@ -455,22 +474,72 @@ impl Evaluator {
         let Some(cache_dir) = &self.package_cache_dir else {
             return Ok(None);
         };
-        let (data_path, url_path) = package_cache_paths(cache_dir, url, extension);
-        let cached_url = match self.capabilities.read_to_string(&url_path).await {
-            Ok(cached_url) => cached_url,
+        let cache_dir = cache_dir.clone();
+        let (data_path, meta_path) = self.checked_cache_paths(&cache_dir, url, extension).await?;
+        let metadata = match self.capabilities.read_to_string(&meta_path).await {
+            Ok(metadata) => metadata,
             Err(Error::Io(_, error)) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(None);
             }
             Err(error) => return Err(error),
         };
+        let (cached_url, expected_digest) = parse_cache_metadata(&metadata)?;
         if cached_url != url {
             return Ok(None);
         }
-        match self.capabilities.read_bytes(&data_path).await {
-            Ok(bytes) => Ok(Some(bytes)),
-            Err(Error::Io(_, error)) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(error),
+        let bytes = match self.capabilities.read_bytes(&data_path).await {
+            Ok(bytes) => Some(bytes),
+            Err(Error::Io(_, error)) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
+        let Some(bytes) = bytes else {
+            // Metadata without its blob is a half-written entry, not a hit.
+            return Ok(None);
+        };
+        if content_digest(&bytes) != expected_digest {
+            return Err(Error::Eval(format!(
+                "package cache digest mismatch for {url}"
+            )));
         }
+        Ok(Some(bytes))
+    }
+
+    /// Resolve the cache file paths for `url`, rejecting any path that would
+    /// escape the configured cache directory (e.g. through a symlinked
+    /// `packages` directory). Nonexistent ancestors fall back to a lexical
+    /// check so a not-yet-created cache is still allowed.
+    async fn checked_cache_paths(
+        &mut self,
+        cache_dir: &Path,
+        url: &str,
+        extension: &str,
+    ) -> Result<(PathBuf, PathBuf)> {
+        let (data_path, meta_path) = package_cache_paths(cache_dir, url, extension);
+        let base = self
+            .capabilities
+            .canonicalize(cache_dir)
+            .await
+            .unwrap_or_else(|_| cache_dir.to_path_buf());
+        for path in [&data_path, &meta_path] {
+            let resolved = match path.parent() {
+                Some(parent) => self
+                    .capabilities
+                    .canonicalize(parent)
+                    .await
+                    .map(|canonical_parent| {
+                        canonical_parent.join(path.file_name().unwrap_or_default())
+                    })
+                    .unwrap_or_else(|_| path.clone()),
+                None => path.clone(),
+            };
+            if !resolved.starts_with(&base) {
+                return Err(Error::Eval(format!(
+                    "package cache path escapes cache directory: {}",
+                    path.display()
+                )));
+            }
+        }
+        Ok((data_path, meta_path))
     }
 
     /// Cache `bytes` for `url`. The fetch path ignores the error; preloading does not.
@@ -483,14 +552,20 @@ impl Evaluator {
         let Some(cache_dir) = &self.package_cache_dir else {
             return Ok(());
         };
-        let (data_path, url_path) = package_cache_paths(cache_dir, url, extension);
+        let cache_dir = cache_dir.clone();
+        let (data_path, _) = self.checked_cache_paths(&cache_dir, url, extension).await?;
         let Some(parent) = data_path.parent() else {
             return Ok(());
         };
-        self.capabilities.create_dir_all(parent).await?;
+        let parent = parent.to_path_buf();
+        self.capabilities.create_dir_all(&parent).await?;
+        // Re-check after directory creation: a symlinked `packages` directory
+        // must not redirect writes outside the cache directory.
+        let (data_path, meta_path) = self.checked_cache_paths(&cache_dir, url, extension).await?;
         self.capabilities.write_atomic(&data_path, bytes).await?;
+        let metadata = format_cache_metadata(url, bytes);
         self.capabilities
-            .write_atomic(&url_path, url.as_bytes())
+            .write_atomic(&meta_path, metadata.as_bytes())
             .await
     }
 
@@ -527,9 +602,15 @@ impl Evaluator {
         let Some(cache_dir) = &self.package_cache_dir else {
             return;
         };
-        let (data_path, url_path) = package_cache_paths(cache_dir, url, extension);
+        let cache_dir = cache_dir.clone();
+        let Ok((data_path, meta_path)) = self.checked_cache_paths(&cache_dir, url, extension).await
+        else {
+            // Never remove anything when the path cannot be proven to stay
+            // inside the cache directory.
+            return;
+        };
         let _ = self.capabilities.remove_file(&data_path).await;
-        let _ = self.capabilities.remove_file(&url_path).await;
+        let _ = self.capabilities.remove_file(&meta_path).await;
     }
 
     /// Download a package zip and extract it to a temp directory.
@@ -5616,15 +5697,65 @@ enum PackageSource {
 
 fn package_cache_paths(cache_dir: &Path, url: &str, extension: &str) -> (PathBuf, PathBuf) {
     // FNV-1a gives package URLs stable, filesystem-safe names without making
-    // the cache layout depend on platform path rules. The adjacent URL file
-    // detects the extraordinarily unlikely hash collision.
+    // the cache layout depend on platform path rules. The adjacent metadata
+    // file detects the extraordinarily unlikely hash collision.
     let mut hash = 0xcbf29ce484222325_u64;
     for byte in url.as_bytes() {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(0x100000001b3);
     }
     let base = cache_dir.join("packages").join(format!("{hash:016x}"));
-    (base.with_extension(extension), base.with_extension("url"))
+    (base.with_extension(extension), base.with_extension("meta"))
+}
+
+/// Version marker for the package cache metadata format. Caches written by
+/// other versions are rejected instead of being trusted blindly.
+const PACKAGE_CACHE_METADATA_VERSION: &str = "pklr-package-cache-v1";
+
+/// Non-cryptographic integrity digest for cached package bytes: the length
+/// plus two FNV-1a-64 lanes with distinct offset bases. Detects corruption
+/// and truncated writes; it is not a security boundary.
+fn content_digest(bytes: &[u8]) -> String {
+    let mut lane_a = 0xcbf29ce484222325_u64;
+    let mut lane_b = 0x84222325cbf29ce4_u64;
+    for (index, byte) in bytes.iter().enumerate() {
+        lane_a ^= u64::from(*byte);
+        lane_a = lane_a.wrapping_mul(0x100000001b3);
+        lane_b ^= u64::from(*byte).wrapping_add(index as u64);
+        lane_b = lane_b.wrapping_mul(0x100000001b3);
+    }
+    format!("{:016x}{:016x}{:016x}", bytes.len() as u64, lane_a, lane_b)
+}
+
+fn format_cache_metadata(url: &str, bytes: &[u8]) -> String {
+    format!(
+        "{PACKAGE_CACHE_METADATA_VERSION}\n{url}\n{}\n",
+        content_digest(bytes)
+    )
+}
+
+/// Parse cache metadata into (url, digest). Each rejection reason (corrupt
+/// structure, unsupported version) gets a distinct, stable message prefix so
+/// callers and tests can tell them apart.
+fn parse_cache_metadata(content: &str) -> Result<(&str, &str)> {
+    let lines: Vec<&str> = content.lines().collect();
+    if lines.len() != 3 {
+        return Err(Error::Eval(
+            "package cache metadata is corrupt: expected 3 lines".to_string(),
+        ));
+    }
+    if lines[0] != PACKAGE_CACHE_METADATA_VERSION {
+        return Err(Error::Eval(format!(
+            "unsupported package cache metadata version: {}",
+            lines[0]
+        )));
+    }
+    if lines[2].is_empty() || !lines[2].bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(Error::Eval(
+            "package cache metadata is corrupt: invalid digest".to_string(),
+        ));
+    }
+    Ok((lines[1], lines[2]))
 }
 
 fn validate_package_bytes(url: &str, extension: &str, bytes: &[u8]) -> Result<()> {
@@ -5652,7 +5783,108 @@ fn validate_package_bytes(url: &str, extension: &str, bytes: &[u8]) -> Result<()
 }
 
 pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
+    write_atomic_with(&mut StdAtomicWriteOps, path, bytes)
+}
+
+/// The stage boundaries of an atomic file write. Extracted so tests can
+/// inject failures at each boundary (create, blob write, flush, rename,
+/// directory sync) without changing the production write path.
+pub(crate) trait AtomicWriteOps {
+    fn create_temp(&mut self, temp_path: &Path) -> std::io::Result<()>;
+    fn write_blob(&mut self, temp_path: &Path, bytes: &[u8]) -> std::io::Result<()>;
+    fn flush_sync(&mut self, temp_path: &Path) -> std::io::Result<()>;
+    fn rename(&mut self, temp_path: &Path, target: &Path) -> std::io::Result<()>;
+    fn sync_dir(&mut self, dir: &Path) -> std::io::Result<()>;
+    fn remove_file(&mut self, path: &Path) -> std::io::Result<()>;
+    fn target_exists(&mut self, path: &Path) -> bool;
+}
+
+/// Filesystem-backed [`AtomicWriteOps`] used in production.
+pub(crate) struct StdAtomicWriteOps;
+
+impl AtomicWriteOps for StdAtomicWriteOps {
+    fn create_temp(&mut self, temp_path: &Path) -> std::io::Result<()> {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(temp_path)
+            .map(drop)
+    }
+
+    fn write_blob(&mut self, temp_path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+        use std::io::Write;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(temp_path)
+            .and_then(|mut file| file.write_all(bytes))
+    }
+
+    fn flush_sync(&mut self, temp_path: &Path) -> std::io::Result<()> {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(temp_path)
+            .and_then(|file| file.sync_all())
+    }
+
+    fn rename(&mut self, temp_path: &Path, target: &Path) -> std::io::Result<()> {
+        match std::fs::rename(temp_path, target) {
+            Ok(()) => Ok(()),
+            // Windows rename does not replace an existing file. There is a
+            // brief non-atomic gap on that platform, but the destination must
+            // not retain stale bytes while its URL sidecar is updated.
+            Err(_) if self.target_exists(target) => {
+                std::fs::remove_file(target).and_then(|()| std::fs::rename(temp_path, target))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn sync_dir(&mut self, dir: &Path) -> std::io::Result<()> {
+        // Best-effort: some platforms and filesystems cannot sync directories.
+        let Ok(file) = std::fs::File::open(dir) else {
+            return Ok(());
+        };
+        let _ = file.sync_all();
+        Ok(())
+    }
+
+    fn remove_file(&mut self, path: &Path) -> std::io::Result<()> {
+        std::fs::remove_file(path)
+    }
+
+    fn target_exists(&mut self, path: &Path) -> bool {
+        path.exists()
+    }
+}
+
+/// Write `bytes` to `path` atomically: create a sibling temp file, write the
+/// blob, flush it to disk, rename over the target, then sync the directory.
+/// A failure at any stage removes the temp file and never leaves a partially
+/// written target behind.
+pub(crate) fn write_atomic_with(
+    ops: &mut dyn AtomicWriteOps,
+    path: &Path,
+    bytes: &[u8],
+) -> std::io::Result<()> {
+    let temp_path = atomic_temp_path_for(path);
+    let result = (|| {
+        ops.create_temp(&temp_path)?;
+        ops.write_blob(&temp_path, bytes)?;
+        ops.flush_sync(&temp_path)?;
+        ops.rename(&temp_path, path)?;
+        if let Some(parent) = path.parent() {
+            ops.sync_dir(parent)?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = ops.remove_file(&temp_path);
+    }
+    result
+}
+
+/// The sibling temp path [`write_atomic_with`] uses while writing `path`.
+pub(crate) fn atomic_temp_path_for(path: &Path) -> PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -5660,35 +5892,50 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("cache");
-    let temp_path = path.with_file_name(format!(
+    path.with_file_name(format!(
         ".{file_name}.tmp-{}-{}",
         std::process::id(),
         COUNTER.fetch_add(1, Ordering::Relaxed)
-    ));
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temp_path)?;
-    let write_result = file.write_all(bytes).and_then(|()| file.sync_all());
-    drop(file);
-    if let Err(error) = write_result {
-        let _ = std::fs::remove_file(&temp_path);
-        return Err(error);
-    }
-    let rename_result = match std::fs::rename(&temp_path, path) {
-        Ok(()) => return Ok(()),
-        // Windows rename does not replace an existing file. There is a brief
-        // non-atomic gap on that platform, but the destination must not retain
-        // stale bytes while its URL sidecar is updated.
-        Err(_) if path.exists() => {
-            std::fs::remove_file(path).and_then(|()| std::fs::rename(&temp_path, path))
-        }
-        Err(error) => Err(error),
+    ))
+}
+
+/// Whether `file_name` looks like a leftover temp file from
+/// [`write_atomic_with`]: `.{name}.tmp-{pid}-{counter}`.
+pub(crate) fn is_atomic_temp_file(file_name: &str) -> bool {
+    let Some(rest) = file_name.strip_prefix('.') else {
+        return false;
     };
-    if rename_result.is_err() {
-        let _ = std::fs::remove_file(temp_path);
+    let Some((_, suffix)) = rest.split_once(".tmp-") else {
+        return false;
+    };
+    let Some((pid, counter)) = suffix.split_once('-') else {
+        return false;
+    };
+    !pid.is_empty()
+        && pid.bytes().all(|byte| byte.is_ascii_digit())
+        && !counter.is_empty()
+        && counter.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+/// Remove leftover atomic-write temp files directly under `dir`.
+/// Returns the number of files removed. A missing directory is not an error.
+pub(crate) fn cleanup_stale_temp_files(dir: &Path) -> std::io::Result<usize> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error),
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if is_atomic_temp_file(name) && std::fs::remove_file(entry.path()).is_ok() {
+            removed += 1;
+        }
     }
-    rename_result
+    Ok(removed)
 }
 
 /// Resolve a `package://` URI to a download source.
@@ -6837,5 +7084,205 @@ mod package_uri_tests {
                 .unwrap_err()
                 .to_string();
         assert!(err.contains("unsupported package URI"));
+    }
+}
+
+#[cfg(test)]
+mod atomic_write_tests {
+    use super::{
+        AtomicWriteOps, StdAtomicWriteOps, cleanup_stale_temp_files, content_digest,
+        format_cache_metadata, is_atomic_temp_file, parse_cache_metadata, write_atomic_with,
+    };
+    use std::path::{Path, PathBuf};
+
+    fn unique_test_dir(label: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "pklr-atomic-write-test-{label}-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    enum Stage {
+        CreateTemp,
+        WriteBlob,
+        FlushSync,
+        Rename,
+        SyncDir,
+    }
+
+    /// Wraps the real filesystem ops and fails exactly one stage.
+    struct FailAtStage {
+        stage: Stage,
+        inner: StdAtomicWriteOps,
+    }
+
+    fn injected_error() -> std::io::Error {
+        std::io::Error::new(std::io::ErrorKind::Interrupted, "injected fault")
+    }
+
+    impl AtomicWriteOps for FailAtStage {
+        fn create_temp(&mut self, temp_path: &Path) -> std::io::Result<()> {
+            if self.stage == Stage::CreateTemp {
+                return Err(injected_error());
+            }
+            self.inner.create_temp(temp_path)
+        }
+        fn write_blob(&mut self, temp_path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+            if self.stage == Stage::WriteBlob {
+                return Err(injected_error());
+            }
+            self.inner.write_blob(temp_path, bytes)
+        }
+        fn flush_sync(&mut self, temp_path: &Path) -> std::io::Result<()> {
+            if self.stage == Stage::FlushSync {
+                return Err(injected_error());
+            }
+            self.inner.flush_sync(temp_path)
+        }
+        fn rename(&mut self, temp_path: &Path, target: &Path) -> std::io::Result<()> {
+            if self.stage == Stage::Rename {
+                return Err(injected_error());
+            }
+            self.inner.rename(temp_path, target)
+        }
+        fn sync_dir(&mut self, dir: &Path) -> std::io::Result<()> {
+            if self.stage == Stage::SyncDir {
+                return Err(injected_error());
+            }
+            self.inner.sync_dir(dir)
+        }
+        fn remove_file(&mut self, path: &Path) -> std::io::Result<()> {
+            self.inner.remove_file(path)
+        }
+        fn target_exists(&mut self, path: &Path) -> bool {
+            self.inner.target_exists(path)
+        }
+    }
+
+    fn leftover_temp_files(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| is_atomic_temp_file(name))
+            .collect()
+    }
+
+    #[test]
+    fn failures_at_each_stage_preserve_the_old_target_and_leave_no_half_files() {
+        for stage in [
+            Stage::CreateTemp,
+            Stage::WriteBlob,
+            Stage::FlushSync,
+            Stage::Rename,
+            Stage::SyncDir,
+        ] {
+            let dir = unique_test_dir(&format!("{stage:?}"));
+            let target = dir.join("cache.blob");
+            std::fs::write(&target, b"old-bytes").unwrap();
+
+            let mut ops = FailAtStage {
+                stage,
+                inner: StdAtomicWriteOps,
+            };
+            let error = write_atomic_with(&mut ops, &target, b"new-bytes").unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::Interrupted);
+
+            let committed = std::fs::read(&target).unwrap();
+            if stage == Stage::SyncDir {
+                // The rename already committed; a directory-sync failure must
+                // not roll back or corrupt the committed file.
+                assert_eq!(committed, b"new-bytes", "stage {stage:?}");
+            } else {
+                // Every earlier failure keeps the previous cache entry intact.
+                assert_eq!(committed, b"old-bytes", "stage {stage:?}");
+            }
+            assert!(
+                leftover_temp_files(&dir).is_empty(),
+                "stage {stage:?} left temp files behind"
+            );
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn successful_write_replaces_the_target() {
+        let dir = unique_test_dir("success");
+        let target = dir.join("cache.blob");
+        std::fs::write(&target, b"old-bytes").unwrap();
+
+        write_atomic_with(&mut StdAtomicWriteOps, &target, b"new-bytes").unwrap();
+
+        assert_eq!(std::fs::read(&target).unwrap(), b"new-bytes");
+        assert!(leftover_temp_files(&dir).is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn temp_file_names_are_recognized() {
+        assert!(is_atomic_temp_file(".cache.blob.tmp-123-4"));
+        assert!(is_atomic_temp_file(".cache.tmp-1-0"));
+        assert!(!is_atomic_temp_file("cache.blob"));
+        assert!(!is_atomic_temp_file(".cache.blob.tmp-123"));
+        assert!(!is_atomic_temp_file(".cache.blob.tmp-abc-4"));
+        assert!(!is_atomic_temp_file(".tmp-123-4")); // no target name before .tmp-
+        assert!(!is_atomic_temp_file("cache.blob.tmp-123-4")); // missing leading dot
+    }
+
+    #[test]
+    fn stale_temp_files_are_cleaned_on_next_startup() {
+        let dir = unique_test_dir("cleanup");
+        std::fs::write(dir.join(".pkg.meta.tmp-9999-1"), b"half").unwrap();
+        std::fs::write(dir.join(".pkg.zip.tmp-9999-2"), b"half").unwrap();
+        std::fs::write(dir.join("pkg.meta"), b"committed").unwrap();
+        std::fs::write(dir.join("notes.txt"), b"unrelated").unwrap();
+
+        let removed = cleanup_stale_temp_files(&dir).unwrap();
+
+        assert_eq!(removed, 2);
+        let remaining: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(remaining.len(), 2);
+        assert!(remaining.iter().any(|name| name == "pkg.meta"));
+        assert!(remaining.iter().any(|name| name == "notes.txt"));
+        // A missing directory is not an error.
+        assert_eq!(cleanup_stale_temp_files(&dir.join("gone")).unwrap(), 0);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn cache_metadata_roundtrips_and_rejects_each_bad_state() {
+        let metadata = format_cache_metadata("https://example.test/pkg.zip", b"bytes");
+        let (url, digest) = parse_cache_metadata(&metadata).unwrap();
+        assert_eq!(url, "https://example.test/pkg.zip");
+        assert_eq!(digest, content_digest(b"bytes"));
+
+        let corrupt = parse_cache_metadata("pklr-package-cache-v1\nonly-two\n").unwrap_err();
+        assert!(corrupt.to_string().contains("metadata is corrupt"), "{corrupt}");
+
+        let bad_version =
+            parse_cache_metadata("pklr-package-cache-v99\nu\n0123456789abcdef\n").unwrap_err();
+        assert!(
+            bad_version
+                .to_string()
+                .contains("unsupported package cache metadata version"),
+            "{bad_version}"
+        );
+
+        let bad_digest =
+            parse_cache_metadata("pklr-package-cache-v1\nu\nnot-hex!\n").unwrap_err();
+        assert!(bad_digest.to_string().contains("metadata is corrupt"), "{bad_digest}");
+
+        assert_ne!(content_digest(b"a"), content_digest(b"b"));
+        assert_ne!(content_digest(b"ab"), content_digest(b"abc"));
     }
 }

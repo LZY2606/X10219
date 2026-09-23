@@ -339,11 +339,12 @@ fn blocking_preload_uses_custom_capabilities() {
     let files = files.lock().unwrap();
     assert_eq!(files.len(), 2);
     assert!(files.values().any(|value| value == b"answer = 42\n"));
-    assert!(
-        files
-            .values()
-            .any(|value| value == b"https://example.com/pkg@1.0.0.pkl")
-    );
+    assert!(files.values().any(|value| {
+        let text = String::from_utf8_lossy(value);
+        let mut lines = text.lines();
+        lines.next() == Some("pklr-package-cache-v1")
+            && lines.next() == Some("https://example.com/pkg@1.0.0.pkl")
+    }));
 }
 
 #[test]
