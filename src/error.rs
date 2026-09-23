@@ -55,6 +55,26 @@ pub enum Error {
 
     #[error("Unsupported feature: {0}")]
     Unsupported(String),
+
+    /// Package cache metadata is missing required fields or cannot be parsed.
+    #[error("corrupt package cache metadata for {url}: {reason}")]
+    CacheMetadata { url: String, reason: String },
+
+    /// The cache layout version recorded for an entry is not supported.
+    #[error("unsupported package cache version {found} for {url}; supported version is {supported}")]
+    CacheVersion {
+        url: String,
+        found: u32,
+        supported: u32,
+    },
+
+    /// Cached bytes do not match the digest recorded in the metadata.
+    #[error("package cache digest mismatch for {url}")]
+    CacheDigest { url: String },
+
+    /// Cache metadata points at a blob path outside the cache directory.
+    #[error("package cache entry escapes the cache directory: {path}")]
+    CacheEscape { path: String },
 }
 
 impl Error {

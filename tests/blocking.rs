@@ -337,13 +337,14 @@ fn blocking_preload_uses_custom_capabilities() {
         .unwrap();
 
     let files = files.lock().unwrap();
-    assert_eq!(files.len(), 2);
+    assert_eq!(files.len(), 3);
     assert!(files.values().any(|value| value == b"answer = 42\n"));
     assert!(
         files
             .values()
             .any(|value| value == b"https://example.com/pkg@1.0.0.pkl")
     );
+    assert!(files.keys().any(|path| path.extension().is_some_and(|ext| ext == "meta")));
 }
 
 #[test]

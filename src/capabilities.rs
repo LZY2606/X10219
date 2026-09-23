@@ -51,6 +51,72 @@ pub trait EvalCapabilities: Send + Sync {
         })
     }
 
+    /// Flush a directory's metadata so a recent rename is durable.
+    ///
+    /// The default implementation is a best-effort no-op on platforms that do
+    /// not expose directory file descriptors. Embedders (and tests) can
+    /// override it to observe or fail the directory-sync boundary explicitly.
+    fn sync_dir<'a>(&'a mut self, dir: &'a Path) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            #[cfg(unix)]
+            {
+                use std::os::fd::AsRawFd;
+                match std::fs::File::open(dir) {
+                    Ok(file) => {
+                        file.sync_all()
+                            .map_err(|error| crate::Error::Io(dir.to_path_buf(), error))?;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(crate::Error::Io(dir.to_path_buf(), error)),
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = dir;
+            }
+            Ok(())
+        })
+    }
+
+    /// Remove staging files left behind by interrupted atomic writes.
+    ///
+    /// Returns the removed paths. Called lazily before a cache directory is
+    /// first used by an evaluator, so a crash between writing a temp file and
+    /// renaming it cannot leave content that could be mistaken for an entry.
+    fn sweep_staging<'a>(
+        &'a mut self,
+        dir: &'a Path,
+        prefix: &'a str,
+    ) -> BoxFuture<'a, Result<Vec<PathBuf>>> {
+        Box::pin(async move {
+            let mut removed = Vec::new();
+            let entries = match std::fs::read_dir(dir) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(removed),
+                Err(error) => return Err(crate::Error::Io(dir.to_path_buf(), error)),
+            };
+            for entry in entries {
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(error) => return Err(crate::Error::Io(dir.to_path_buf(), error)),
+                };
+                let path = entry.path();
+                let is_staging = path.file_name().and_then(|name| name.to_str()).is_some_and(
+                    |name| {
+                        name.starts_with(&format!(".{prefix}."))
+                            && name.contains(".tmp")
+                    },
+                );
+                if is_staging {
+                    std::fs::remove_file(&path)
+                        .map_err(|error| crate::Error::Io(path.clone(), error))?;
+                    removed.push(path);
+                }
+            }
+            Ok(removed)
+        })
+    }
+
     #[cfg(feature = "package-zip-core")]
     fn extract_zip<'a>(
         &'a mut self,
