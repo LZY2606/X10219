@@ -1,5 +1,7 @@
 #[cfg(feature = "eval-core")]
 pub mod capabilities;
+#[cfg(feature = "eval-core")]
+pub mod cache;
 pub mod error;
 #[cfg(feature = "eval-core")]
 pub mod eval;

@@ -51,6 +51,36 @@ pub trait EvalCapabilities: Send + Sync {
         })
     }
 
+    /// List regular files under `root` as `(forward-slash relative path,
+    /// absolute path)` pairs. Used for bounded startup sweeps of staging
+    /// files; embedders may back it with an in-memory file system.
+    fn list_dir<'a>(
+        &'a mut self,
+        root: &'a Path,
+    ) -> BoxFuture<'a, Result<Vec<(String, PathBuf)>>> {
+        Box::pin(async move { Ok(crate::cache::list_files_bounded(root)) })
+    }
+
+    /// Best-effort directory durability barrier (`fsync` on the directory).
+    /// The default implementation is a no-op on platforms without directory
+    /// fsync support. Embedders may fail it deliberately to exercise the
+    /// cache's failure handling.
+    fn sync_dir<'a>(&'a mut self, path: &'a Path) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            #[cfg(not(windows))]
+            {
+                let file = std::fs::OpenOptions::new().read(true).open(path)?;
+                file.sync_all()
+                    .map_err(|error| crate::Error::Io(path.to_path_buf(), error))?;
+            }
+            #[cfg(windows)]
+            {
+                let _ = path;
+            }
+            Ok(())
+        })
+    }
+
     #[cfg(feature = "package-zip-core")]
     fn extract_zip<'a>(
         &'a mut self,

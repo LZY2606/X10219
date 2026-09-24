@@ -7,6 +7,7 @@ use indexmap::IndexMap;
 use std::path::{Path, PathBuf};
 
 use crate::capabilities::EvalCapabilities;
+use crate::cache::{self, CacheMetadata};
 use crate::error::{Error, Result};
 use crate::lexer;
 use crate::parser::{self, BinOp, Entry, Expr, Modifier, Module, Property, StringInterpPart, UnOp};
@@ -43,6 +44,8 @@ pub struct Evaluator {
     /// HTTP URL rewrite rules (source_prefix → target_prefix).
     /// Longest matching prefix wins.
     http_rewrites: Vec<(String, String)>,
+    /// Whether staging files from interrupted cache writes were swept once.
+    package_cache_swept: bool,
     /// Converters extracted from `output.renderer.converters`.
     /// Each entry maps a class name to a converter lambda.
     converters: Vec<(String, Value)>,
