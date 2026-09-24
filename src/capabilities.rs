@@ -51,6 +51,55 @@ pub trait EvalCapabilities: Send + Sync {
         })
     }
 
+    /// Stage `bytes` at `staging` for a later atomic cache promote.
+    fn cache_stage_write<'a>(
+        &'a mut self,
+        staging: &'a Path,
+        bytes: &'a [u8],
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            crate::cache::stage_write(staging, bytes)
+                .map_err(|error| crate::Error::Io(staging.to_path_buf(), error))
+        })
+    }
+
+    /// Flush a staged cache file to stable storage.
+    fn cache_flush<'a>(&'a mut self, staging: &'a Path) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            crate::cache::flush_file(staging)
+                .map_err(|error| crate::Error::Io(staging.to_path_buf(), error))
+        })
+    }
+
+    /// Atomically replace `final_path` with the staged cache file.
+    fn cache_promote<'a>(
+        &'a mut self,
+        staging: &'a Path,
+        final_path: &'a Path,
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            crate::cache::promote(staging, final_path)
+                .map_err(|error| crate::Error::Io(final_path.to_path_buf(), error))
+        })
+    }
+
+    /// Durably sync a directory that received a promoted cache file.
+    fn cache_sync_dir<'a>(&'a mut self, dir: &'a Path) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            crate::cache::sync_dir(dir)
+                .map_err(|error| crate::Error::Io(dir.to_path_buf(), error))
+        })
+    }
+
+    /// Remove leftover cache staging files directly under `dir`, returning
+    /// the removed paths.
+    fn sweep_staged<'a>(&'a mut self, dir: &'a Path) -> BoxFuture<'a, Result<Vec<PathBuf>>> {
+        Box::pin(async move {
+            crate::cache::sweep_staged(dir)
+                .map_err(|error| crate::Error::Io(dir.to_path_buf(), error))
+        })
+    }
+
     #[cfg(feature = "package-zip-core")]
     fn extract_zip<'a>(
         &'a mut self,
@@ -158,6 +207,26 @@ impl Default for NativeCapabilities {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Run a cache IO operation on Tokio's blocking pool when inside a runtime,
+/// directly on the current thread otherwise.
+#[cfg(feature = "native-io")]
+async fn native_cache_io<T, F>(path: PathBuf, operation: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> std::io::Result<T> + Send + 'static,
+{
+    #[cfg(feature = "async")]
+    {
+        if tokio::runtime::Handle::try_current().is_ok() {
+            return tokio::task::spawn_blocking(operation)
+                .await
+                .map_err(|error| crate::Error::Eval(format!("cache IO task failed: {error}")))?
+                .map_err(|error| crate::Error::Io(path, error));
+        }
+    }
+    operation().map_err(|error| crate::Error::Io(path, error))
 }
 
 #[cfg(all(feature = "native-io", feature = "http"))]
@@ -282,6 +351,63 @@ impl EvalCapabilities for NativeCapabilities {
             result.map_err(|error| crate::Error::Io(path.to_path_buf(), error))
         })
     }
+
+    fn cache_stage_write<'a>(
+        &'a mut self,
+        staging: &'a Path,
+        bytes: &'a [u8],
+    ) -> BoxFuture<'a, Result<()>> {
+        let staging = staging.to_path_buf();
+        let bytes = bytes.to_vec();
+        Box::pin(async move {
+            let task_staging = staging.clone();
+            native_cache_io(staging, move || {
+                crate::cache::stage_write(&task_staging, &bytes)
+            })
+            .await
+        })
+    }
+
+    fn cache_flush<'a>(&'a mut self, staging: &'a Path) -> BoxFuture<'a, Result<()>> {
+        let staging = staging.to_path_buf();
+        Box::pin(async move {
+            let task_staging = staging.clone();
+            native_cache_io(staging, move || crate::cache::flush_file(&task_staging)).await
+        })
+    }
+
+    fn cache_promote<'a>(
+        &'a mut self,
+        staging: &'a Path,
+        final_path: &'a Path,
+    ) -> BoxFuture<'a, Result<()>> {
+        let staging = staging.to_path_buf();
+        let final_path = final_path.to_path_buf();
+        Box::pin(async move {
+            let task_final = final_path.clone();
+            native_cache_io(final_path, move || {
+                crate::cache::promote(&staging, &task_final)
+            })
+            .await
+        })
+    }
+
+    fn cache_sync_dir<'a>(&'a mut self, dir: &'a Path) -> BoxFuture<'a, Result<()>> {
+        let dir = dir.to_path_buf();
+        Box::pin(async move {
+            let task_dir = dir.clone();
+            native_cache_io(dir, move || crate::cache::sync_dir(&task_dir)).await
+        })
+    }
+
+    fn sweep_staged<'a>(&'a mut self, dir: &'a Path) -> BoxFuture<'a, Result<Vec<PathBuf>>> {
+        let dir = dir.to_path_buf();
+        Box::pin(async move {
+            let task_dir = dir.clone();
+            native_cache_io(dir, move || crate::cache::sweep_staged(&task_dir)).await
+        })
+    }
+
 
     #[cfg(feature = "package-zip-core")]
     fn extract_zip<'a>(

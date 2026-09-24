@@ -8,6 +8,7 @@ use pklr::{EvalCapabilities, Evaluator};
 #[derive(Clone, Default)]
 struct MemoryCacheCapabilities {
     files: Arc<Mutex<HashMap<PathBuf, Vec<u8>>>>,
+    staged: Arc<Mutex<HashMap<PathBuf, Vec<u8>>>>,
 }
 
 impl EvalCapabilities for MemoryCacheCapabilities {
@@ -59,6 +60,70 @@ impl EvalCapabilities for MemoryCacheCapabilities {
             .unwrap()
             .insert(path.to_path_buf(), bytes.to_vec());
         Box::pin(async { Ok(()) })
+    }
+
+    fn cache_stage_write<'a>(
+        &'a mut self,
+        staging: &'a Path,
+        bytes: &'a [u8],
+    ) -> BoxFuture<'a, pklr::Result<()>> {
+        self.staged
+            .lock()
+            .unwrap()
+            .insert(staging.to_path_buf(), bytes.to_vec());
+        Box::pin(async { Ok(()) })
+    }
+
+    fn cache_flush<'a>(&'a mut self, _staging: &'a Path) -> BoxFuture<'a, pklr::Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn cache_promote<'a>(
+        &'a mut self,
+        staging: &'a Path,
+        final_path: &'a Path,
+    ) -> BoxFuture<'a, pklr::Result<()>> {
+        let bytes = self.staged.lock().unwrap().remove(staging);
+        let result = match bytes {
+            Some(bytes) => {
+                self.files
+                    .lock()
+                    .unwrap()
+                    .insert(final_path.to_path_buf(), bytes);
+                Ok(())
+            }
+            None => Err(pklr::Error::Io(
+                staging.to_path_buf(),
+                std::io::Error::from(std::io::ErrorKind::NotFound),
+            )),
+        };
+        Box::pin(async move { result })
+    }
+
+    fn cache_sync_dir<'a>(&'a mut self, _dir: &'a Path) -> BoxFuture<'a, pklr::Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn sweep_staged<'a>(
+        &'a mut self,
+        dir: &'a Path,
+    ) -> BoxFuture<'a, pklr::Result<Vec<PathBuf>>> {
+        let mut staged = self.staged.lock().unwrap();
+        let removed: Vec<PathBuf> = staged
+            .keys()
+            .filter(|path| {
+                path.parent() == Some(dir)
+                    && path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(pklr::cache::is_staging_file_name)
+            })
+            .cloned()
+            .collect();
+        for path in &removed {
+            staged.remove(path);
+        }
+        Box::pin(async move { Ok(removed) })
     }
 
     fn read_env<'a>(&'a mut self, _name: &'a str) -> BoxFuture<'a, pklr::Result<Option<String>>> {
@@ -339,11 +404,15 @@ fn blocking_preload_uses_custom_capabilities() {
     let files = files.lock().unwrap();
     assert_eq!(files.len(), 2);
     assert!(files.values().any(|value| value == b"answer = 42\n"));
-    assert!(
-        files
-            .values()
-            .any(|value| value == b"https://example.com/pkg@1.0.0.pkl")
-    );
+    let metadata = files
+        .values()
+        .find_map(|value| {
+            std::str::from_utf8(value)
+                .ok()
+                .and_then(|text| pklr::cache::CacheMetadata::from_json(text).ok())
+        })
+        .expect("preload writes cache metadata");
+    assert_eq!(metadata.url, "https://example.com/pkg@1.0.0.pkl");
 }
 
 #[test]

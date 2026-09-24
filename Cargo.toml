@@ -42,6 +42,7 @@ url             = { version = "2", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+serde = { version = "1", features = ["derive"] }
 
 [[test]]
 name = "integration"
@@ -54,6 +55,10 @@ required-features = ["async", "package-zip"]
 [[test]]
 name = "blocking"
 required-features = ["blocking"]
+
+[[test]]
+name = "contract_model"
+required-features = ["blocking", "async", "package-zip"]
 
 [profile.dev]
 debug = 1

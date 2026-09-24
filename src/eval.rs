@@ -43,6 +43,10 @@ pub struct Evaluator {
     /// HTTP URL rewrite rules (source_prefix → target_prefix).
     /// Longest matching prefix wins.
     http_rewrites: Vec<(String, String)>,
+    /// Whether leftover cache staging files were swept for this evaluator.
+    cache_staging_swept: bool,
+    /// Sequence number for cache staging file names.
+    cache_write_sequence: u64,
     /// Converters extracted from `output.renderer.converters`.
     /// Each entry maps a class name to a converter lambda.
     converters: Vec<(String, Value)>,
@@ -93,6 +97,8 @@ impl Default for Evaluator {
             package_http_roots: HashSet::new(),
             offline: false,
             http_rewrites: Vec::new(),
+            cache_staging_swept: false,
+            cache_write_sequence: 0,
             converters: Vec::new(),
             warned_deprecated: std::collections::HashSet::new(),
         }
@@ -113,6 +119,11 @@ impl Evaluator {
     }
 
     pub fn with_capabilities(capabilities: impl EvalCapabilities + 'static) -> Self {
+        Self::with_boxed_capabilities(Box::new(capabilities))
+    }
+
+    /// Construct an evaluator from pre-boxed host capabilities.
+    pub fn with_boxed_capabilities(capabilities: Box<dyn EvalCapabilities>) -> Self {
         Self {
             base_path: PathBuf::from("."),
             max_depth: 32,
@@ -121,13 +132,15 @@ impl Evaluator {
             module_scopes: HashMap::new(),
             env_reads: BTreeMap::new(),
             scoped_imports_in_flight: HashSet::new(),
-            capabilities: Box::new(capabilities),
+            capabilities,
             #[cfg(feature = "package-zip-core")]
             package_dirs: HashMap::new(),
             package_cache_dir: None,
             package_http_roots: HashSet::new(),
             offline: false,
             http_rewrites: Vec::new(),
+            cache_staging_swept: false,
+            cache_write_sequence: 0,
             converters: Vec::new(),
             warned_deprecated: std::collections::HashSet::new(),
         }
@@ -452,11 +465,41 @@ impl Evaluator {
     }
 
     async fn read_package_cache(&mut self, url: &str, extension: &str) -> Result<Option<Vec<u8>>> {
-        let Some(cache_dir) = &self.package_cache_dir else {
+        if self.package_cache_dir.is_none() {
             return Ok(None);
-        };
-        let (data_path, url_path) = package_cache_paths(cache_dir, url, extension);
-        let cached_url = match self.capabilities.read_to_string(&url_path).await {
+        }
+        self.sweep_cache_staging_once().await;
+        let cache_dir = self
+            .package_cache_dir
+            .clone()
+            .expect("package cache directory checked above");
+        let paths = crate::cache::entry_paths(&cache_dir, url, extension);
+        // Version 1: metadata describes a content-addressed, verified blob.
+        match self.capabilities.read_to_string(&paths.metadata).await {
+            Ok(text) => {
+                let metadata = crate::cache::CacheMetadata::from_json(&text)?;
+                if metadata.url != url {
+                    // Hash collision or a foreign entry: treat as a miss.
+                    return Ok(None);
+                }
+                let blob_path = metadata.blob_path(&cache_dir);
+                let bytes = match self.capabilities.read_bytes(&blob_path).await {
+                    Ok(bytes) => bytes,
+                    Err(Error::Io(_, error))
+                        if error.kind() == std::io::ErrorKind::NotFound =>
+                    {
+                        return Ok(None);
+                    }
+                    Err(error) => return Err(error),
+                };
+                metadata.verify_digest(&bytes)?;
+                return Ok(Some(bytes));
+            }
+            Err(Error::Io(_, error)) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        // Legacy (v0) layout: a URL sidecar next to the blob.
+        let cached_url = match self.capabilities.read_to_string(&paths.legacy_url).await {
             Ok(cached_url) => cached_url,
             Err(Error::Io(_, error)) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(None);
@@ -466,7 +509,7 @@ impl Evaluator {
         if cached_url != url {
             return Ok(None);
         }
-        match self.capabilities.read_bytes(&data_path).await {
+        match self.capabilities.read_bytes(&paths.blob).await {
             Ok(bytes) => Ok(Some(bytes)),
             Err(Error::Io(_, error)) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(error),
@@ -480,18 +523,70 @@ impl Evaluator {
         extension: &str,
         bytes: &[u8],
     ) -> Result<()> {
-        let Some(cache_dir) = &self.package_cache_dir else {
+        if self.package_cache_dir.is_none() {
             return Ok(());
-        };
-        let (data_path, url_path) = package_cache_paths(cache_dir, url, extension);
-        let Some(parent) = data_path.parent() else {
+        }
+        self.sweep_cache_staging_once().await;
+        let cache_dir = self
+            .package_cache_dir
+            .clone()
+            .expect("package cache directory checked above");
+        let metadata = crate::cache::CacheMetadata::new(url, extension, bytes);
+        let blob_path = metadata.blob_path(&cache_dir);
+        let metadata_path = crate::cache::entry_paths(&cache_dir, url, extension).metadata;
+        let Some(parent) = blob_path.parent() else {
             return Ok(());
         };
         self.capabilities.create_dir_all(parent).await?;
-        self.capabilities.write_atomic(&data_path, bytes).await?;
-        self.capabilities
-            .write_atomic(&url_path, url.as_bytes())
+        // Blob first, then metadata: an interrupted write can leave an orphan
+        // blob, but never metadata pointing at a missing or wrong blob.
+        self.write_cache_file(&blob_path, bytes).await?;
+        self.write_cache_file(&metadata_path, metadata.to_json().as_bytes())
             .await
+    }
+
+    /// Remove leftover staging files under the package cache once per evaluator.
+    async fn sweep_cache_staging_once(&mut self) {
+        if self.cache_staging_swept {
+            return;
+        }
+        self.cache_staging_swept = true;
+        let Some(cache_dir) = &self.package_cache_dir else {
+            return;
+        };
+        // Best effort: leftover staging files must never block evaluation.
+        let _ = self
+            .capabilities
+            .sweep_staged(&cache_dir.join("packages"))
+            .await;
+    }
+
+    /// Write one cache file through the stage/flush/promote/sync pipeline.
+    async fn write_cache_file(&mut self, final_path: &Path, bytes: &[u8]) -> Result<()> {
+        let sequence = self.cache_write_sequence;
+        self.cache_write_sequence += 1;
+        let staging =
+            crate::cache::staging_path(final_path, std::process::id(), sequence);
+        let result = self.write_staged_cache_file(&staging, final_path, bytes).await;
+        if result.is_err() {
+            let _ = self.capabilities.remove_file(&staging).await;
+        }
+        result
+    }
+
+    async fn write_staged_cache_file(
+        &mut self,
+        staging: &Path,
+        final_path: &Path,
+        bytes: &[u8],
+    ) -> Result<()> {
+        self.capabilities.cache_stage_write(staging, bytes).await?;
+        self.capabilities.cache_flush(staging).await?;
+        self.capabilities.cache_promote(staging, final_path).await?;
+        if let Some(dir) = final_path.parent() {
+            self.capabilities.cache_sync_dir(dir).await?;
+        }
+        Ok(())
     }
 
     /// Seed the persistent package cache with `bytes` for `url`.
@@ -527,9 +622,10 @@ impl Evaluator {
         let Some(cache_dir) = &self.package_cache_dir else {
             return;
         };
-        let (data_path, url_path) = package_cache_paths(cache_dir, url, extension);
-        let _ = self.capabilities.remove_file(&data_path).await;
-        let _ = self.capabilities.remove_file(&url_path).await;
+        let paths = crate::cache::entry_paths(cache_dir, url, extension);
+        let _ = self.capabilities.remove_file(&paths.metadata).await;
+        let _ = self.capabilities.remove_file(&paths.blob).await;
+        let _ = self.capabilities.remove_file(&paths.legacy_url).await;
     }
 
     /// Download a package zip and extract it to a temp directory.
@@ -5614,19 +5710,6 @@ enum PackageSource {
     Zip(String, String),
 }
 
-fn package_cache_paths(cache_dir: &Path, url: &str, extension: &str) -> (PathBuf, PathBuf) {
-    // FNV-1a gives package URLs stable, filesystem-safe names without making
-    // the cache layout depend on platform path rules. The adjacent URL file
-    // detects the extraordinarily unlikely hash collision.
-    let mut hash = 0xcbf29ce484222325_u64;
-    for byte in url.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    let base = cache_dir.join("packages").join(format!("{hash:016x}"));
-    (base.with_extension(extension), base.with_extension("url"))
-}
-
 fn validate_package_bytes(url: &str, extension: &str, bytes: &[u8]) -> Result<()> {
     if extension == "pkl" {
         std::str::from_utf8(bytes)
@@ -5652,43 +5735,21 @@ fn validate_package_bytes(url: &str, extension: &str, bytes: &[u8]) -> Result<()
 }
 
 pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("cache");
-    let temp_path = path.with_file_name(format!(
-        ".{file_name}.tmp-{}-{}",
+    let staging = crate::cache::staging_path(
+        path,
         std::process::id(),
-        COUNTER.fetch_add(1, Ordering::Relaxed)
-    ));
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temp_path)?;
-    let write_result = file.write_all(bytes).and_then(|()| file.sync_all());
-    drop(file);
-    if let Err(error) = write_result {
-        let _ = std::fs::remove_file(&temp_path);
-        return Err(error);
+        COUNTER.fetch_add(1, Ordering::Relaxed),
+    );
+    let result = crate::cache::stage_write(&staging, bytes)
+        .and_then(|()| crate::cache::flush_file(&staging))
+        .and_then(|()| crate::cache::promote(&staging, path));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&staging);
     }
-    let rename_result = match std::fs::rename(&temp_path, path) {
-        Ok(()) => return Ok(()),
-        // Windows rename does not replace an existing file. There is a brief
-        // non-atomic gap on that platform, but the destination must not retain
-        // stale bytes while its URL sidecar is updated.
-        Err(_) if path.exists() => {
-            std::fs::remove_file(path).and_then(|()| std::fs::rename(&temp_path, path))
-        }
-        Err(error) => Err(error),
-    };
-    if rename_result.is_err() {
-        let _ = std::fs::remove_file(temp_path);
-    }
-    rename_result
+    result
 }
 
 /// Resolve a `package://` URI to a download source.

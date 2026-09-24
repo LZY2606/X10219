@@ -1,5 +1,6 @@
 #[cfg(feature = "eval-core")]
 pub mod capabilities;
+pub mod cache;
 pub mod error;
 #[cfg(feature = "eval-core")]
 pub mod eval;
@@ -83,6 +84,7 @@ pub struct EvalOptions {
 pub struct AsyncEvaluatorBuilder {
     #[cfg(feature = "http")]
     client: Option<reqwest::Client>,
+    custom_capabilities: Option<Box<dyn EvalCapabilities>>,
     http_rewrites: Vec<String>,
     package_cache_dir: Option<std::path::PathBuf>,
     offline: bool,
@@ -94,6 +96,7 @@ pub struct AsyncEvaluatorBuilder {
 #[derive(Default)]
 pub struct EvaluatorBuilder {
     agent: Option<ureq::Agent>,
+    custom_capabilities: Option<Box<dyn EvalCapabilities>>,
     http_rewrites: Vec<String>,
     package_cache_dir: Option<std::path::PathBuf>,
     offline: bool,
@@ -112,6 +115,15 @@ struct PreloadedPackage {
 impl AsyncEvaluatorBuilder {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Evaluate with custom host capabilities instead of the native defaults.
+    ///
+    /// This is the supported dependency-injection seam for hermetic tests and
+    /// hosts that virtualize IO. Public evaluation semantics are unchanged.
+    pub fn capabilities(mut self, capabilities: impl EvalCapabilities + 'static) -> Self {
+        self.custom_capabilities = Some(Box::new(capabilities));
+        self
     }
 
     /// Use a custom HTTP client for proxy, certificate, or timeout configuration.
@@ -159,7 +171,10 @@ impl AsyncEvaluatorBuilder {
     ///
     /// A package that fails to preload is skipped and fetched normally.
     pub async fn build(self) -> Evaluator {
-        let mut evaluator = Evaluator::new_async();
+        let mut evaluator = match self.custom_capabilities {
+            Some(capabilities) => Evaluator::with_boxed_capabilities(capabilities),
+            None => Evaluator::new_async(),
+        };
         #[cfg(feature = "http")]
         if let Some(client) = self.client {
             evaluator
@@ -195,6 +210,15 @@ impl AsyncEvaluatorBuilder {
 impl EvaluatorBuilder {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Evaluate with custom host capabilities instead of the blocking defaults.
+    ///
+    /// This is the supported dependency-injection seam for hermetic tests and
+    /// hosts that virtualize IO. Public evaluation semantics are unchanged.
+    pub fn capabilities(mut self, capabilities: impl EvalCapabilities + 'static) -> Self {
+        self.custom_capabilities = Some(Box::new(capabilities));
+        self
     }
 
     /// Use a custom synchronous HTTP agent.
@@ -238,11 +262,16 @@ impl EvaluatorBuilder {
 
     /// Build a configured evaluator for direct source evaluation.
     pub fn build(self) -> Evaluator {
-        let capabilities = match self.agent {
-            Some(agent) => BlockingCapabilities::with_http_agent(agent),
-            None => BlockingCapabilities::new(),
+        let mut evaluator = match self.custom_capabilities {
+            Some(capabilities) => Evaluator::with_boxed_capabilities(capabilities),
+            None => {
+                let capabilities = match self.agent {
+                    Some(agent) => BlockingCapabilities::with_http_agent(agent),
+                    None => BlockingCapabilities::new(),
+                };
+                Evaluator::with_capabilities(capabilities)
+            }
         };
-        let mut evaluator = Evaluator::with_capabilities(capabilities);
         evaluator.set_http_rewrites(&self.http_rewrites);
         if let Some(cache_dir) = self.package_cache_dir {
             evaluator.set_package_cache_dir(cache_dir);
