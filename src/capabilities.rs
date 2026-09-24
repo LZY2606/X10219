@@ -45,6 +45,67 @@ pub trait EvalCapabilities: Send + Sync {
         })
     }
 
+    /// Write `bytes` to `path`, creating it and failing if it already exists.
+    ///
+    /// This is the first half of the package cache's atomic write protocol;
+    /// pair it with [`flush_file`](Self::flush_file) and
+    /// [`rename`](Self::rename). Tests override it to inject write faults.
+    fn write_bytes<'a>(&'a mut self, path: &'a Path, bytes: &'a [u8]) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            use std::io::Write;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+                .and_then(|mut file| file.write_all(bytes))
+                .map_err(|error| crate::Error::Io(path.to_path_buf(), error))
+        })
+    }
+
+    /// Flush `path`'s data to stable storage.
+    fn flush_file<'a>(&'a mut self, path: &'a Path) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(path)
+                .and_then(|file| file.sync_all())
+                .map_err(|error| crate::Error::Io(path.to_path_buf(), error))
+        })
+    }
+
+    /// Move `from` to `to`, replacing `to` when the platform requires it.
+    fn rename<'a>(&'a mut self, from: &'a Path, to: &'a Path) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            let result = std::fs::rename(from, to);
+            let result = match result {
+                // Windows rename does not replace an existing destination.
+                Err(_) if to.exists() => {
+                    std::fs::remove_file(to).and_then(|()| std::fs::rename(from, to))
+                }
+                other => other,
+            };
+            result.map_err(|error| crate::Error::Io(to.to_path_buf(), error))
+        })
+    }
+
+    /// Flush directory metadata so renames inside it are durable. Best-effort
+    /// on platforms that do not support syncing directories.
+    fn sync_dir<'a>(&'a mut self, path: &'a Path) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            #[cfg(unix)]
+            {
+                std::fs::File::open(path)
+                    .and_then(|dir| dir.sync_all())
+                    .map_err(|error| crate::Error::Io(path.to_path_buf(), error))
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = path;
+                Ok(())
+            }
+        })
+    }
+
     fn remove_file<'a>(&'a mut self, path: &'a Path) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
             std::fs::remove_file(path).map_err(|error| crate::Error::Io(path.to_path_buf(), error))

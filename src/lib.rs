@@ -4,6 +4,9 @@ pub mod error;
 #[cfg(feature = "eval-core")]
 pub mod eval;
 pub mod lexer;
+#[cfg(feature = "eval-core")]
+#[doc(hidden)]
+pub mod package_cache;
 pub mod parser;
 #[cfg(feature = "eval-core")]
 pub mod value;

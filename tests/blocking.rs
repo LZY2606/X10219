@@ -61,6 +61,47 @@ impl EvalCapabilities for MemoryCacheCapabilities {
         Box::pin(async { Ok(()) })
     }
 
+    fn write_bytes<'a>(
+        &'a mut self,
+        path: &'a Path,
+        bytes: &'a [u8],
+    ) -> BoxFuture<'a, pklr::Result<()>> {
+        self.files
+            .lock()
+            .unwrap()
+            .insert(path.to_path_buf(), bytes.to_vec());
+        Box::pin(async { Ok(()) })
+    }
+
+    fn flush_file<'a>(&'a mut self, _path: &'a Path) -> BoxFuture<'a, pklr::Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn rename<'a>(&'a mut self, from: &'a Path, to: &'a Path) -> BoxFuture<'a, pklr::Result<()>> {
+        let mut files = self.files.lock().unwrap();
+        let bytes = files.remove(from).ok_or_else(|| {
+            pklr::Error::Io(
+                from.to_path_buf(),
+                std::io::Error::from(std::io::ErrorKind::NotFound),
+            )
+        });
+        match bytes {
+            Ok(bytes) => {
+                files.insert(to.to_path_buf(), bytes);
+                drop(files);
+                Box::pin(async { Ok(()) })
+            }
+            Err(error) => {
+                drop(files);
+                Box::pin(async move { Err(error) })
+            }
+        }
+    }
+
+    fn sync_dir<'a>(&'a mut self, _path: &'a Path) -> BoxFuture<'a, pklr::Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+
     fn read_env<'a>(&'a mut self, _name: &'a str) -> BoxFuture<'a, pklr::Result<Option<String>>> {
         Box::pin(async { Ok(None) })
     }
@@ -339,11 +380,12 @@ fn blocking_preload_uses_custom_capabilities() {
     let files = files.lock().unwrap();
     assert_eq!(files.len(), 2);
     assert!(files.values().any(|value| value == b"answer = 42\n"));
-    assert!(
-        files
-            .values()
-            .any(|value| value == b"https://example.com/pkg@1.0.0.pkl")
-    );
+    let meta = files
+        .keys()
+        .find(|path| path.extension().and_then(|ext| ext.to_str()) == Some("json"))
+        .expect("preload writes a metadata file");
+    let meta_text = String::from_utf8(files[meta].clone()).unwrap();
+    assert!(meta_text.contains("https://example.com/pkg@1.0.0.pkl"));
 }
 
 #[test]
