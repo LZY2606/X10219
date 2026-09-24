@@ -167,7 +167,11 @@ impl Evaluator {
 
     /// Persist downloaded package content under `path`.
     pub fn set_package_cache_dir(&mut self, path: impl Into<PathBuf>) {
-        self.package_cache_dir = Some(path.into());
+        let path = path.into();
+        // Best-effort: drop temp files left behind by interrupted cache
+        // writes from a previous process ("next startup" cleanup).
+        let _ = cleanup_stale_temp_files(&packages_dir(&path));
+        self.package_cache_dir = Some(path);
     }
 
     /// Disable network access. Package imports can still use the persistent cache.
@@ -456,18 +460,29 @@ impl Evaluator {
             return Ok(None);
         };
         let (data_path, url_path) = package_cache_paths(cache_dir, url, extension);
-        let cached_url = match self.capabilities.read_to_string(&url_path).await {
-            Ok(cached_url) => cached_url,
+        let metadata = match self.capabilities.read_to_string(&url_path).await {
+            Ok(metadata) => metadata,
             Err(Error::Io(_, error)) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(None);
             }
             Err(error) => return Err(error),
         };
+        // Corrupt metadata, an unsupported metadata version, a URL mismatch,
+        // or a checksum mismatch all reject the entry (treated as a miss)
+        // rather than serving untrusted bytes.
+        let Some((cached_url, checksum)) = parse_cache_metadata(&metadata) else {
+            return Ok(None);
+        };
         if cached_url != url {
             return Ok(None);
         }
         match self.capabilities.read_bytes(&data_path).await {
-            Ok(bytes) => Ok(Some(bytes)),
+            Ok(bytes) => {
+                if fnv1a64(&bytes) != checksum {
+                    return Ok(None);
+                }
+                Ok(Some(bytes))
+            }
             Err(Error::Io(_, error)) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(error),
         }
@@ -488,9 +503,11 @@ impl Evaluator {
             return Ok(());
         };
         self.capabilities.create_dir_all(parent).await?;
+        // The blob is written before the metadata so a crash can never leave
+        // metadata pointing at a missing or half-written blob.
         self.capabilities.write_atomic(&data_path, bytes).await?;
         self.capabilities
-            .write_atomic(&url_path, url.as_bytes())
+            .write_atomic(&url_path, cache_metadata_contents(url, bytes).as_bytes())
             .await
     }
 
@@ -5614,16 +5631,55 @@ enum PackageSource {
     Zip(String, String),
 }
 
-fn package_cache_paths(cache_dir: &Path, url: &str, extension: &str) -> (PathBuf, PathBuf) {
-    // FNV-1a gives package URLs stable, filesystem-safe names without making
-    // the cache layout depend on platform path rules. The adjacent URL file
-    // detects the extraordinarily unlikely hash collision.
+fn packages_dir(cache_dir: &Path) -> PathBuf {
+    cache_dir.join("packages")
+}
+
+/// FNV-1a 64-bit. Gives package URLs stable, filesystem-safe cache names
+/// without making the cache layout depend on platform path rules, and serves
+/// as the integrity checksum recorded in cache metadata.
+fn fnv1a64(bytes: &[u8]) -> u64 {
     let mut hash = 0xcbf29ce484222325_u64;
-    for byte in url.as_bytes() {
+    for byte in bytes {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(0x100000001b3);
     }
-    let base = cache_dir.join("packages").join(format!("{hash:016x}"));
+    hash
+}
+
+/// Version marker for the cache metadata sidecar. Entries written by other
+/// (older or newer) layout versions are rejected as misses, never served.
+#[doc(hidden)]
+pub const CACHE_METADATA_VERSION: &str = "pklr-cache-v1";
+
+/// Metadata sidecar contents for a cached blob: version, URL, checksum.
+#[doc(hidden)]
+pub fn cache_metadata_contents(url: &str, bytes: &[u8]) -> String {
+    format!(
+        "{CACHE_METADATA_VERSION}\n{url}\nfnv1a64={:016x}\n",
+        fnv1a64(bytes)
+    )
+}
+
+/// Parse a metadata sidecar into (url, blob checksum). Returns `None` for
+/// unsupported versions or corrupt metadata.
+fn parse_cache_metadata(metadata: &str) -> Option<(&str, u64)> {
+    let mut lines = metadata.lines();
+    if lines.next()? != CACHE_METADATA_VERSION {
+        return None;
+    }
+    let url = lines.next()?;
+    let checksum = u64::from_str_radix(lines.next()?.strip_prefix("fnv1a64=")?, 16).ok()?;
+    Some((url, checksum))
+}
+
+/// Locate the (blob, metadata) cache files for `url` under `cache_dir`.
+#[doc(hidden)]
+pub fn package_cache_paths(cache_dir: &Path, url: &str, extension: &str) -> (PathBuf, PathBuf) {
+    // The adjacent metadata file detects the extraordinarily unlikely hash
+    // collision and records the expected blob checksum.
+    let hash = fnv1a64(url.as_bytes());
+    let base = packages_dir(cache_dir).join(format!("{hash:016x}"));
     (base.with_extension(extension), base.with_extension("url"))
 }
 
@@ -5652,6 +5708,56 @@ fn validate_package_bytes(url: &str, extension: &str, bytes: &[u8]) -> Result<()
 }
 
 pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    write_atomic_staged(path, bytes, None).map_err(|error| error.source)
+}
+
+/// The ordered stages of the atomic cache-write protocol. Exposed so tests
+/// can inject a fault at each durability boundary.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AtomicWriteStage {
+    CreateTemp,
+    Write,
+    Flush,
+    Rename,
+    SyncDir,
+}
+
+/// An atomic write failure tagged with the stage that failed.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct AtomicWriteError {
+    pub stage: AtomicWriteStage,
+    pub source: std::io::Error,
+}
+
+impl std::fmt::Display for AtomicWriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "atomic write failed at {:?}: {}", self.stage, self.source)
+    }
+}
+
+impl std::error::Error for AtomicWriteError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+/// Write `bytes` to `path` atomically: create a sibling temp file, write,
+/// flush to disk, rename over the target, then sync the parent directory.
+///
+/// `fault` is a test-only hook that fails the given stage with a synthetic
+/// error, mimicking an IO failure at that boundary. On any failure before
+/// the rename, the temp file is removed; a rename or directory-sync failure
+/// leaves the previously committed destination (if any) untouched in the
+/// rename case, while a directory-sync failure happens after the rename has
+/// already landed.
+#[doc(hidden)]
+pub fn write_atomic_staged(
+    path: &Path,
+    bytes: &[u8],
+    fault: Option<AtomicWriteStage>,
+) -> std::result::Result<(), AtomicWriteError> {
     use std::io::Write;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -5660,35 +5766,143 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("cache");
-    let temp_path = path.with_file_name(format!(
-        ".{file_name}.tmp-{}-{}",
+    let temp_path = path.with_file_name(cache_temp_file_name(
+        file_name,
         std::process::id(),
-        COUNTER.fetch_add(1, Ordering::Relaxed)
+        COUNTER.fetch_add(1, Ordering::Relaxed),
     ));
+    let injected = |stage: AtomicWriteStage| -> Option<AtomicWriteError> {
+        (fault == Some(stage)).then(|| AtomicWriteError {
+            stage,
+            source: std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("injected fault at {stage:?}"),
+            ),
+        })
+    };
+    let fail = |stage: AtomicWriteStage, source: std::io::Error| AtomicWriteError {
+        stage,
+        source,
+    };
+
+    if let Some(error) = injected(AtomicWriteStage::CreateTemp) {
+        return Err(error);
+    }
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
-        .open(&temp_path)?;
-    let write_result = file.write_all(bytes).and_then(|()| file.sync_all());
-    drop(file);
+        .open(&temp_path)
+        .map_err(|error| fail(AtomicWriteStage::CreateTemp, error))?;
+
+    let write_result = match injected(AtomicWriteStage::Write) {
+        Some(error) => Err(error.source),
+        None => file.write_all(bytes),
+    };
     if let Err(error) = write_result {
+        drop(file);
         let _ = std::fs::remove_file(&temp_path);
+        return Err(fail(AtomicWriteStage::Write, error));
+    }
+
+    let flush_result = match injected(AtomicWriteStage::Flush) {
+        Some(error) => Err(error.source),
+        None => file.sync_all(),
+    };
+    if let Err(error) = flush_result {
+        drop(file);
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(fail(AtomicWriteStage::Flush, error));
+    }
+    drop(file);
+
+    let rename_result = match injected(AtomicWriteStage::Rename) {
+        Some(error) => Err(error.source),
+        None => match std::fs::rename(&temp_path, path) {
+            Ok(()) => Ok(()),
+            // Windows rename does not replace an existing file. There is a
+            // brief non-atomic gap on that platform, but the destination must
+            // not retain stale bytes while its metadata sidecar is updated.
+            Err(_) if path.exists() => {
+                std::fs::remove_file(path).and_then(|()| std::fs::rename(&temp_path, path))
+            }
+            Err(error) => Err(error),
+        },
+    };
+    if let Err(error) = rename_result {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(fail(AtomicWriteStage::Rename, error));
+    }
+
+    if let Some(error) = injected(AtomicWriteStage::SyncDir) {
         return Err(error);
     }
-    let rename_result = match std::fs::rename(&temp_path, path) {
-        Ok(()) => return Ok(()),
-        // Windows rename does not replace an existing file. There is a brief
-        // non-atomic gap on that platform, but the destination must not retain
-        // stale bytes while its URL sidecar is updated.
-        Err(_) if path.exists() => {
-            std::fs::remove_file(path).and_then(|()| std::fs::rename(&temp_path, path))
+    sync_parent_dir(path).map_err(|error| fail(AtomicWriteStage::SyncDir, error))
+}
+
+/// Best-effort fsync of the directory containing `path` so the rename is
+/// durable. Directory sync is only meaningful on Unix; elsewhere it is a
+/// no-op.
+fn sync_parent_dir(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::File::open(parent)?.sync_all()?;
         }
-        Err(error) => Err(error),
-    };
-    if rename_result.is_err() {
-        let _ = std::fs::remove_file(temp_path);
     }
-    rename_result
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
+}
+
+/// Temp-file name used by the atomic cache-write protocol.
+#[doc(hidden)]
+pub fn cache_temp_file_name(file_name: &str, pid: u32, counter: u64) -> String {
+    format!(".{file_name}.tmp-{pid}-{counter}")
+}
+
+/// Whether `name` looks like a temp file left behind by an interrupted
+/// atomic cache write (`.<name>.tmp-<pid>-<counter>`).
+#[doc(hidden)]
+pub fn is_cache_temp_file_name(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix('.') else {
+        return false;
+    };
+    let Some((_, suffix)) = rest.rsplit_once(".tmp-") else {
+        return false;
+    };
+    let mut parts = suffix.split('-');
+    let is_digits = |part: Option<&str>| {
+        matches!(part, Some(part) if !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+    };
+    is_digits(parts.next()) && is_digits(parts.next()) && parts.next().is_none()
+}
+
+/// Remove stale atomic-write temp files directly under `dir`, returning the
+/// paths that were removed. Used to clean up after interrupted cache writes
+/// on the next startup.
+#[doc(hidden)]
+pub fn cleanup_stale_temp_files(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let mut removed = Vec::new();
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(removed),
+        Err(error) => return Err(error),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        if is_cache_temp_file_name(&name) {
+            std::fs::remove_file(entry.path())?;
+            removed.push(entry.path());
+        }
+    }
+    Ok(removed)
 }
 
 /// Resolve a `package://` URI to a download source.

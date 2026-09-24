@@ -42,6 +42,8 @@ url             = { version = "2", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+pollster = "1"
+zip = { version = "8", default-features = false, features = ["deflate"] }
 
 [[test]]
 name = "integration"
@@ -54,6 +56,11 @@ required-features = ["async", "package-zip"]
 [[test]]
 name = "blocking"
 required-features = ["blocking"]
+
+[[test]]
+name = "model_contracts"
+path = "tests/model_contracts/main.rs"
+required-features = ["async", "blocking", "package-zip"]
 
 [profile.dev]
 debug = 1
