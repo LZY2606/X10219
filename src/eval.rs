@@ -36,6 +36,8 @@ pub struct Evaluator {
     package_dirs: HashMap<String, PathBuf>,
     /// Directory used to persist downloaded package content across evaluators.
     package_cache_dir: Option<PathBuf>,
+    /// Whether stale temp files in the package cache were already cleaned up.
+    cache_cleanup_done: bool,
     /// HTTP URL roots whose sources belong to direct-download packages.
     package_http_roots: HashSet<String>,
     /// Whether network access is disabled for this evaluator.
@@ -90,6 +92,7 @@ impl Default for Evaluator {
             #[cfg(feature = "package-zip-core")]
             package_dirs: HashMap::new(),
             package_cache_dir: None,
+            cache_cleanup_done: false,
             package_http_roots: HashSet::new(),
             offline: false,
             http_rewrites: Vec::new(),
@@ -125,6 +128,7 @@ impl Evaluator {
             #[cfg(feature = "package-zip-core")]
             package_dirs: HashMap::new(),
             package_cache_dir: None,
+            cache_cleanup_done: false,
             package_http_roots: HashSet::new(),
             offline: false,
             http_rewrites: Vec::new(),
@@ -429,8 +433,9 @@ impl Evaluator {
             Ok(None) => {}
             Err(error) if self.offline => return Err(error),
             Err(_) => {
-                // The persistent cache is an optimization while online. If it
-                // is unreadable, fetch from the network and continue without it.
+                // The persistent cache is an optimization while online. A
+                // corrupt or unreadable entry is dropped and refetched.
+                self.remove_package_cache(url, extension).await;
             }
         }
         if self.offline {
@@ -452,25 +457,17 @@ impl Evaluator {
     }
 
     async fn read_package_cache(&mut self, url: &str, extension: &str) -> Result<Option<Vec<u8>>> {
-        let Some(cache_dir) = &self.package_cache_dir else {
+        let Some(cache_dir) = self.package_cache_dir.clone() else {
             return Ok(None);
         };
-        let (data_path, url_path) = package_cache_paths(cache_dir, url, extension);
-        let cached_url = match self.capabilities.read_to_string(&url_path).await {
-            Ok(cached_url) => cached_url,
-            Err(Error::Io(_, error)) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(None);
-            }
-            Err(error) => return Err(error),
-        };
-        if cached_url != url {
-            return Ok(None);
-        }
-        match self.capabilities.read_bytes(&data_path).await {
-            Ok(bytes) => Ok(Some(bytes)),
-            Err(Error::Io(_, error)) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(error),
-        }
+        self.ensure_cache_cleanup().await;
+        crate::cache::read_entry(
+            self.capabilities.as_mut(),
+            &cache_dir,
+            url,
+            extension,
+        )
+        .await
     }
 
     /// Cache `bytes` for `url`. The fetch path ignores the error; preloading does not.
@@ -480,18 +477,30 @@ impl Evaluator {
         extension: &str,
         bytes: &[u8],
     ) -> Result<()> {
-        let Some(cache_dir) = &self.package_cache_dir else {
+        let Some(cache_dir) = self.package_cache_dir.clone() else {
             return Ok(());
         };
-        let (data_path, url_path) = package_cache_paths(cache_dir, url, extension);
-        let Some(parent) = data_path.parent() else {
-            return Ok(());
-        };
-        self.capabilities.create_dir_all(parent).await?;
-        self.capabilities.write_atomic(&data_path, bytes).await?;
-        self.capabilities
-            .write_atomic(&url_path, url.as_bytes())
-            .await
+        self.ensure_cache_cleanup().await;
+        crate::cache::write_entry(
+            self.capabilities.as_mut(),
+            &cache_dir,
+            url,
+            extension,
+            bytes,
+        )
+        .await
+    }
+
+    /// Remove stale temp files and orphaned blobs once per cache directory.
+    /// Best-effort: cleanup failure never blocks evaluation.
+    async fn ensure_cache_cleanup(&mut self) {
+        if self.cache_cleanup_done {
+            return;
+        }
+        self.cache_cleanup_done = true;
+        if let Some(cache_dir) = self.package_cache_dir.clone() {
+            let _ = crate::cache::cleanup_stale(self.capabilities.as_mut(), &cache_dir).await;
+        }
     }
 
     /// Seed the persistent package cache with `bytes` for `url`.
@@ -524,12 +533,16 @@ impl Evaluator {
     }
 
     async fn remove_package_cache(&mut self, url: &str, extension: &str) {
-        let Some(cache_dir) = &self.package_cache_dir else {
+        let Some(cache_dir) = self.package_cache_dir.clone() else {
             return;
         };
-        let (data_path, url_path) = package_cache_paths(cache_dir, url, extension);
-        let _ = self.capabilities.remove_file(&data_path).await;
-        let _ = self.capabilities.remove_file(&url_path).await;
+        let _ = crate::cache::remove_entry(
+            self.capabilities.as_mut(),
+            &cache_dir,
+            url,
+            extension,
+        )
+        .await;
     }
 
     /// Download a package zip and extract it to a temp directory.
@@ -5614,19 +5627,6 @@ enum PackageSource {
     Zip(String, String),
 }
 
-fn package_cache_paths(cache_dir: &Path, url: &str, extension: &str) -> (PathBuf, PathBuf) {
-    // FNV-1a gives package URLs stable, filesystem-safe names without making
-    // the cache layout depend on platform path rules. The adjacent URL file
-    // detects the extraordinarily unlikely hash collision.
-    let mut hash = 0xcbf29ce484222325_u64;
-    for byte in url.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    let base = cache_dir.join("packages").join(format!("{hash:016x}"));
-    (base.with_extension(extension), base.with_extension("url"))
-}
-
 fn validate_package_bytes(url: &str, extension: &str, bytes: &[u8]) -> Result<()> {
     if extension == "pkl" {
         std::str::from_utf8(bytes)
@@ -5651,44 +5651,84 @@ fn validate_package_bytes(url: &str, extension: &str, bytes: &[u8]) -> Result<()
     Ok(())
 }
 
-pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
+fn temp_file_path_for(target: &Path) -> PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let file_name = path
+    let file_name = target
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("cache");
-    let temp_path = path.with_file_name(format!(
+    target.with_file_name(format!(
         ".{file_name}.tmp-{}-{}",
         std::process::id(),
         COUNTER.fetch_add(1, Ordering::Relaxed)
-    ));
-    let mut file = std::fs::OpenOptions::new()
+    ))
+}
+
+/// Create an empty, uniquely named temp file next to `target`.
+#[doc(hidden)]
+pub fn native_create_temp_file(target: &Path) -> std::io::Result<PathBuf> {
+    let temp_path = temp_file_path_for(target);
+    std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&temp_path)?;
-    let write_result = file.write_all(bytes).and_then(|()| file.sync_all());
-    drop(file);
-    if let Err(error) = write_result {
-        let _ = std::fs::remove_file(&temp_path);
-        return Err(error);
-    }
-    let rename_result = match std::fs::rename(&temp_path, path) {
-        Ok(()) => return Ok(()),
+    Ok(temp_path)
+}
+
+/// Write `bytes` to a previously created temp file.
+#[doc(hidden)]
+pub fn native_write_temp_file(temp: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let mut file = std::fs::OpenOptions::new().write(true).open(temp)?;
+    file.write_all(bytes)
+}
+
+/// Flush a written temp file to stable storage before it is renamed.
+#[doc(hidden)]
+pub fn native_flush_temp_file(temp: &Path) -> std::io::Result<()> {
+    std::fs::File::open(temp)?.sync_all()
+}
+
+/// Rename `from` to `to`, replacing `to` on platforms whose rename does not.
+#[doc(hidden)]
+pub fn native_rename_file(from: &Path, to: &Path) -> std::io::Result<()> {
+    match std::fs::rename(from, to) {
+        Ok(()) => Ok(()),
         // Windows rename does not replace an existing file. There is a brief
         // non-atomic gap on that platform, but the destination must not retain
-        // stale bytes while its URL sidecar is updated.
-        Err(_) if path.exists() => {
-            std::fs::remove_file(path).and_then(|()| std::fs::rename(&temp_path, path))
-        }
+        // stale bytes while its metadata is updated.
+        Err(_) if to.exists() => std::fs::remove_file(to).and_then(|()| std::fs::rename(from, to)),
         Err(error) => Err(error),
-    };
-    if rename_result.is_err() {
-        let _ = std::fs::remove_file(temp_path);
     }
-    rename_result
+}
+
+/// Sync a directory after a rename so the new name survives a crash.
+#[doc(hidden)]
+pub fn native_sync_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::fs::File::open(dir)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        Ok(())
+    }
+}
+
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let temp_path = native_create_temp_file(path)?;
+    let result = native_write_temp_file(&temp_path, bytes)
+        .and_then(|()| native_flush_temp_file(&temp_path))
+        .and_then(|()| native_rename_file(&temp_path, path))
+        .and_then(|()| path.parent().map_or(Ok(()), native_sync_dir));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp_path);
+    }
+    result
 }
 
 /// Resolve a `package://` URI to a download source.

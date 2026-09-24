@@ -40,14 +40,92 @@ pub trait EvalCapabilities: Send + Sync {
         bytes: &'a [u8],
     ) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
-            crate::eval::write_atomic(path, bytes)
-                .map_err(|error| crate::Error::Io(path.to_path_buf(), error))
+            let temp = self.create_temp_file(path).await?;
+            let result: Result<()> = async {
+                self.write_temp_file(&temp, bytes).await?;
+                self.flush_temp_file(&temp).await?;
+                self.rename_file(&temp, path).await?;
+                if let Some(parent) = path.parent() {
+                    self.sync_dir(parent).await?;
+                }
+                Ok(())
+            }
+            .await;
+            if result.is_err() {
+                let _ = self.remove_file(&temp).await;
+            }
+            result
         })
     }
 
     fn remove_file<'a>(&'a mut self, path: &'a Path) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
             std::fs::remove_file(path).map_err(|error| crate::Error::Io(path.to_path_buf(), error))
+        })
+    }
+
+    /// List the entries of a directory as full paths. A missing directory
+    /// lists as empty so cache cleanup works before anything was written.
+    fn list_dir<'a>(&'a mut self, path: &'a Path) -> BoxFuture<'a, Result<Vec<PathBuf>>> {
+        Box::pin(async move {
+            match std::fs::read_dir(path) {
+                Ok(entries) => {
+                    let mut paths = Vec::new();
+                    for entry in entries {
+                        let entry =
+                            entry.map_err(|error| crate::Error::Io(path.to_path_buf(), error))?;
+                        paths.push(entry.path());
+                    }
+                    Ok(paths)
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+                Err(error) => Err(crate::Error::Io(path.to_path_buf(), error)),
+            }
+        })
+    }
+
+    /// Create an empty, uniquely named temp file next to `target` and return
+    /// its path. First step of an atomic write.
+    fn create_temp_file<'a>(&'a mut self, target: &'a Path) -> BoxFuture<'a, Result<PathBuf>> {
+        Box::pin(async move {
+            crate::eval::native_create_temp_file(target)
+                .map_err(|error| crate::Error::Io(target.to_path_buf(), error))
+        })
+    }
+
+    /// Write `bytes` to a previously created temp file.
+    fn write_temp_file<'a>(
+        &'a mut self,
+        temp: &'a Path,
+        bytes: &'a [u8],
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            crate::eval::native_write_temp_file(temp, bytes)
+                .map_err(|error| crate::Error::Io(temp.to_path_buf(), error))
+        })
+    }
+
+    /// Flush a written temp file to stable storage before it is renamed.
+    fn flush_temp_file<'a>(&'a mut self, temp: &'a Path) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            crate::eval::native_flush_temp_file(temp)
+                .map_err(|error| crate::Error::Io(temp.to_path_buf(), error))
+        })
+    }
+
+    /// Rename `from` to `to`, replacing `to` when the platform requires it.
+    fn rename_file<'a>(&'a mut self, from: &'a Path, to: &'a Path) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            crate::eval::native_rename_file(from, to)
+                .map_err(|error| crate::Error::Io(to.to_path_buf(), error))
+        })
+    }
+
+    /// Sync a directory after a rename so the new name survives a crash.
+    fn sync_dir<'a>(&'a mut self, dir: &'a Path) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            crate::eval::native_sync_dir(dir)
+                .map_err(|error| crate::Error::Io(dir.to_path_buf(), error))
         })
     }
 
