@@ -51,6 +51,86 @@ pub trait EvalCapabilities: Send + Sync {
         })
     }
 
+    /// Create `path` and write `bytes` to it without flushing file data.
+    ///
+    /// Used for the first, separately fault-injectable stage of a durable
+    /// cache entry publication. The destination must not exist yet.
+    fn cache_write_file<'a>(
+        &'a mut self,
+        path: &'a Path,
+        bytes: &'a [u8],
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+                .map_err(|error| crate::Error::Io(path.to_path_buf(), error))?;
+            file.write_all(bytes)
+                .map_err(|error| crate::Error::Io(path.to_path_buf(), error))
+        })
+    }
+
+    /// Flush a freshly written cache file's data to stable storage.
+    fn cache_flush_file<'a>(&'a mut self, path: &'a Path) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            let file = std::fs::File::open(path)
+                .map_err(|error| crate::Error::Io(path.to_path_buf(), error))?;
+            file.sync_all()
+                .map_err(|error| crate::Error::Io(path.to_path_buf(), error))
+        })
+    }
+
+    /// Rename a cache file into place, replacing any existing destination.
+    fn cache_rename<'a>(
+        &'a mut self,
+        from: &'a Path,
+        to: &'a Path,
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            match std::fs::rename(from, to) {
+                Ok(()) => Ok(()),
+                // Windows rename does not replace an existing file.
+                Err(_) if to.exists() => std::fs::remove_file(to)
+                    .and_then(|()| std::fs::rename(from, to))
+                    .map_err(|error| crate::Error::Io(to.to_path_buf(), error)),
+                Err(error) => Err(crate::Error::Io(to.to_path_buf(), error)),
+            }
+        })
+    }
+
+    /// Synchronize a cache directory entry (best effort on platforms without
+    /// directory fsync support).
+    fn cache_sync_dir<'a>(&'a mut self, path: &'a Path) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            if let Ok(dir) = std::fs::File::open(path) {
+                let _ = dir.sync_all();
+            }
+            Ok(())
+        })
+    }
+
+    /// List the immediate children of a directory. A missing directory is an
+    /// empty listing.
+    fn list_dir<'a>(&'a mut self, path: &'a Path) -> BoxFuture<'a, Result<Vec<PathBuf>>> {
+        Box::pin(async move {
+            match std::fs::read_dir(path) {
+                Ok(entries) => {
+                    let mut paths = Vec::new();
+                    for entry in entries {
+                        let entry =
+                            entry.map_err(|error| crate::Error::Io(path.to_path_buf(), error))?;
+                        paths.push(entry.path());
+                    }
+                    Ok(paths)
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+                Err(error) => Err(crate::Error::Io(path.to_path_buf(), error)),
+            }
+        })
+    }
+
     #[cfg(feature = "package-zip-core")]
     fn extract_zip<'a>(
         &'a mut self,
